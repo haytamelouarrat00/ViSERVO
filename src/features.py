@@ -17,6 +17,42 @@ class Features:
             return kp1, kp2, []
         return kp1, kp2, [m for m, n in matches if m.distance < 0.7 * n.distance]
 
+    def match_xfeat(self):
+        import sys
+        from pathlib import Path
+        import torch
+
+        # Add accelerated_features to sys.path if not present
+        acc_feat_path = str(Path(__file__).resolve().parents[1] / "accelerated_features")
+        if acc_feat_path not in sys.path:
+            sys.path.insert(0, acc_feat_path)
+
+        from accelerated_features.modules.xfeat import XFeat
+
+        xfeat = XFeat()
+
+        # detectAndCompute expects (B, C, H, W) or numpy (H, W, C) or (H, W)
+        # self.reference and self.query are likely grayscale (H, W)
+        out1 = xfeat.detectAndCompute(self.reference, top_k=4096)[0]
+        out2 = xfeat.detectAndCompute(self.query, top_k=4096)[0]
+
+        idxs0, idxs1 = xfeat.match(out1["descriptors"], out2["descriptors"])
+
+        # Convert to cv2.KeyPoint
+        kp1 = [
+            cv2.KeyPoint(float(p[0]), float(p[1]), 5.0) for p in out1["keypoints"]
+        ]
+        kp2 = [
+            cv2.KeyPoint(float(p[0]), float(p[1]), 5.0) for p in out2["keypoints"]
+        ]
+
+        # Convert to cv2.DMatch
+        matches = []
+        for i, j in zip(idxs0, idxs1):
+            matches.append(cv2.DMatch(int(i), int(j), 0.0))
+
+        return kp1, kp2, matches
+
     def ransac_filter(self, kp1, kp2, matches):
         if len(matches) < 4:
             return [0] * len(matches)

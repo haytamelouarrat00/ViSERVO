@@ -13,20 +13,20 @@ class Features:
         kp2, des2 = sift.detectAndCompute(self.query, None)
         flann = cv2.FlannBasedMatcher(dict(algorithm=1, trees=5), dict(checks=50))
         matches = flann.knnMatch(des1, des2, k=2)
-        if len(matches) < 4:
-            raise ValueError("Not enough matches found.")
+        if len(matches) < 2:
+            return kp1, kp2, []
         return kp1, kp2, [m for m, n in matches if m.distance < 0.7 * n.distance]
 
     def ransac_filter(self, kp1, kp2, matches):
         if len(matches) < 4:
-            raise ValueError("Not enough matches to compute homography.")
+            return [0] * len(matches)
         src_pts = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 2)
         dst_pts = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1, 2)
 
         if len(np.unique(src_pts, axis=0)) < 4 or len(np.unique(dst_pts, axis=0)) < 4:
             if np.allclose(src_pts, dst_pts, atol=1e-3):
                 return [1] * len(matches)
-            raise ValueError("Not enough unique matches to compute homography.")
+            return [0] * len(matches)
 
         M, mask = cv2.findHomography(
             src_pts.reshape(-1, 1, 2), dst_pts.reshape(-1, 1, 2), cv2.RANSAC, 5.0
@@ -35,12 +35,54 @@ class Features:
         if M is None or mask is None:
             if np.allclose(src_pts, dst_pts, atol=1e-3):
                 return [1] * len(matches)
-            raise ValueError("Homography estimation failed.")
+            return [0] * len(matches)
 
         inliers = mask.ravel().astype(int).tolist()
         if not any(inliers) and np.allclose(src_pts, dst_pts, atol=1e-3):
             return [1] * len(matches)
         return inliers
+
+    def refine_subpixel(self, image, points):
+        """
+        Refine the position of points in the image to sub-pixel accuracy.
+        Used for corner-like features.
+        """
+        if len(points) == 0:
+            return points
+
+        # Define criteria for the refinement (type, max_iter, epsilon)
+        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 40, 0.001)
+        # Search window size
+        winSize = (11, 11)
+        zeroZone = (-1, -1)
+
+        # points must be float32 and shape (N, 1, 2)
+        pts = np.asarray(points, dtype=np.float32).reshape(-1, 1, 2)
+        
+        # Ensure image is uint8 grayscale
+        if image.dtype != np.uint8:
+            image_u8 = cv2.normalize(image, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        else:
+            image_u8 = image
+
+        refined_pts = cv2.cornerSubPix(image_u8, pts, winSize, zeroZone, criteria)
+        return refined_pts.reshape(-1, 2)
+
+    def refine_correspondence_lk(self, pts1, pts2_guess):
+        """
+        Refine the correspondence of pts1 in the query image using Lucas-Kanade,
+        starting from pts2_guess.
+        """
+        pts1 = np.asarray(pts1, dtype=np.float32).reshape(-1, 1, 2)
+        pts2 = np.asarray(pts2_guess, dtype=np.float32).reshape(-1, 1, 2)
+
+        pts2_refined, status, _ = cv2.calcOpticalFlowPyrLK(
+            self.reference, self.query, pts1, pts2,
+            winSize=(21, 21), maxLevel=3,
+            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 40, 0.001),
+            flags=cv2.OPTFLOW_USE_INITIAL_FLOW
+        )
+        return pts2_refined.reshape(-1, 2), status.ravel()
 
     def extract_quad_features(self, kp1, kp2, inlier_matches):
         """
@@ -83,10 +125,27 @@ class Features:
         rendered_features = np.asarray(
             [kp1[m.queryIdx].pt for m in selected], dtype=np.float32
         )
-        real_features = np.asarray(
+        real_features_guess = np.asarray(
             [kp2[m.trainIdx].pt for m in selected], dtype=np.float32
         )
-        return rendered_features, real_features, selected
+
+        # 1. Refine rendered features to nearby corners in reference image
+        rendered_features_refined = self.refine_subpixel(self.reference, rendered_features)
+
+        # 2. Track refined rendered features into the query image using LK
+        # This provides high-precision sub-pixel correspondence.
+        real_features_refined, status = self.refine_correspondence_lk(
+            rendered_features_refined, real_features_guess
+        )
+
+        # If LK tracking fails for any point, fall back to cornerSubPix on query image
+        for i in range(len(status)):
+            if status[i] == 0:
+                print(f"[Features] LK refinement failed for point {i}, falling back to cornerSubPix.")
+                refined_q = self.refine_subpixel(self.query, real_features_guess[i:i+1])
+                real_features_refined[i] = refined_q[0]
+
+        return rendered_features_refined, real_features_refined, selected
 
     @staticmethod
     def triangle_area(a, b, c):

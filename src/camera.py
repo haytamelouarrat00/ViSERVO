@@ -11,20 +11,24 @@ from pathlib import Path
 
 import numpy as np
 import open3d as o3d
+from scipy.spatial.transform import Rotation as R
 from typing import Any, Tuple, Optional, Union
 from dataclasses import dataclass
 
 
 @dataclass
 class CameraIntrinsics:
-    """Camera intrinsic parameters for pinhole camera model."""
+    """
+    Camera intrinsic parameters for pinhole camera model.
+    All units are in pixels unless otherwise specified.
+    """
 
-    width: int
-    height: int
-    fx: float  # Focal length in x
-    fy: float  # Focal length in y
-    cx: float  # Principal point x
-    cy: float  # Principal point y
+    width: int  # Image width (pixels)
+    height: int  # Image height (pixels)
+    fx: float  # Focal length in x (pixels)
+    fy: float  # Focal length in y (pixels)
+    cx: float  # Principal point x (pixels)
+    cy: float  # Principal point y (pixels)
 
     def to_matrix(self) -> np.ndarray:
         """Convert to 3x3 intrinsic matrix K."""
@@ -85,16 +89,40 @@ class VirtualCamera:
         """
         self.intrinsics = intrinsics
 
-        # Initialize pose: position (x, y, z) and orientation (pitch, roll, yaw)
+        # Initialize pose: position (x, y, z) and orientation (scipy Rotation)
         self._position = np.array([0.0, 0.0, 0.0])  # meters
-        self._orientation = np.array([0.0, 0.0, 0.0])  # radians (pitch, roll, yaw)
+        self._rotation = R.from_euler("xyz", [0.0, 0.0, 0.0])
 
         # Cache transformation matrix
         self._update_extrinsics()
 
+        # Persistent renderer to avoid window creation overhead
+        self._renderer = None
+
+    def _get_renderer(self) -> o3d.visualization.rendering.OffscreenRenderer:
+        """Lazy initialization of the offscreen renderer."""
+        if self._renderer is None:
+            self._renderer = o3d.visualization.rendering.OffscreenRenderer(
+                self.intrinsics.width, self.intrinsics.height
+            )
+        return self._renderer
+
     def _update_extrinsics(self):
         """Update the extrinsic matrix based on current pose."""
-        self._extrinsic_matrix = self._pose_to_matrix(self._position, self._orientation)
+        T = np.eye(4)
+        T[:3, :3] = self._rotation.as_matrix()
+        T[:3, 3] = self._position
+        self._extrinsic_matrix = T
+
+    @property
+    def _orientation(self) -> np.ndarray:
+        """Get Euler angles from internal rotation."""
+        return self._rotation.as_euler("xyz")
+
+    @_orientation.setter
+    def _orientation(self, value: np.ndarray):
+        """Set internal rotation from Euler angles."""
+        self._rotation = R.from_euler("xyz", value)
 
     @staticmethod
     def _pose_to_matrix(position: np.ndarray, orientation: np.ndarray) -> np.ndarray:
@@ -108,35 +136,12 @@ class VirtualCamera:
         Returns:
             4x4 homogeneous transformation matrix (camera-to-world)
         """
-        pitch, roll, yaw = orientation
-
-        # Rotation matrices for each axis
-        R_x = np.array(
-            [
-                [1, 0, 0],
-                [0, np.cos(pitch), -np.sin(pitch)],
-                [0, np.sin(pitch), np.cos(pitch)],
-            ]
-        )
-
-        R_y = np.array(
-            [
-                [np.cos(roll), 0, np.sin(roll)],
-                [0, 1, 0],
-                [-np.sin(roll), 0, np.cos(roll)],
-            ]
-        )
-
-        R_z = np.array(
-            [[np.cos(yaw), -np.sin(yaw), 0], [np.sin(yaw), np.cos(yaw), 0], [0, 0, 1]]
-        )
-
-        # Combined rotation: R = R_z * R_y * R_x (yaw-roll-pitch order)
-        R = R_z @ R_y @ R_x
+        # Use intrinsic 'xyz' order for [pitch, roll, yaw]
+        rot = R.from_euler("xyz", orientation)
 
         # Build 4x4 transformation matrix
         T = np.eye(4)
-        T[:3, :3] = R
+        T[:3, :3] = rot.as_matrix()
         T[:3, 3] = position
 
         return T
@@ -153,21 +158,11 @@ class VirtualCamera:
             Tuple of (position, orientation) where orientation is [pitch, roll, yaw]
         """
         position = matrix[:3, 3]
-        R = matrix[:3, :3]
+        rot_matrix = matrix[:3, :3]
 
-        # Extract Euler angles (assuming yaw-roll-pitch order)
-        # This is the inverse of the composition in _pose_to_matrix
-        roll = np.arctan2(-R[2, 0], np.sqrt(R[0, 0] ** 2 + R[1, 0] ** 2))
-
-        if np.abs(np.cos(roll)) > 1e-6:
-            pitch = np.arctan2(R[2, 1] / np.cos(roll), R[2, 2] / np.cos(roll))
-            yaw = np.arctan2(R[1, 0] / np.cos(roll), R[0, 0] / np.cos(roll))
-        else:
-            # Gimbal lock case
-            pitch = 0
-            yaw = np.arctan2(-R[0, 1], R[1, 1])
-
-        orientation = np.array([pitch, roll, yaw])
+        # Use intrinsic 'xyz' order for [pitch, roll, yaw]
+        rot = R.from_matrix(rot_matrix)
+        orientation = rot.as_euler("xyz")
 
         return position, orientation
 
@@ -238,41 +233,35 @@ class VirtualCamera:
         Returns:
             RGB image as numpy array (H x W x 3) with values in [0, 1]
         """
-        # Create visualizer in offscreen mode
-        vis = o3d.visualization.Visualizer()
-        vis.create_window(
-            width=self.intrinsics.width, height=self.intrinsics.height, visible=False
-        )
+        renderer = self._get_renderer()
+        scene = renderer.scene
+        scene.clear_geometry()
+
+        # Set background color
+        scene.set_background(np.array([*background_color, 1.0]))
+
+        # Use a default material for all geometries
+        material = o3d.visualization.rendering.MaterialRecord()
+        material.shader = "defaultLit"
 
         # Add geometry to scene
-        if isinstance(geometry, list):
-            for geom in geometry:
-                vis.add_geometry(geom)
-        else:
-            vis.add_geometry(geometry)
+        geometries = geometry if isinstance(geometry, list) else [geometry]
+        for i, geom in enumerate(geometries):
+            scene.add_geometry(f"geometry_{i}", geom, material)
 
         # Set camera parameters
-        ctr = vis.get_view_control()
-        pinhole = o3d.camera.PinholeCameraParameters()
-        pinhole.intrinsic = self.intrinsics.to_pinhole_parameters()
-        pinhole.extrinsic = self.get_view_matrix()
-
-        ctr.convert_from_pinhole_camera_parameters(pinhole, allow_arbitrary=True)
-
-        # Set render options
-        render_option = vis.get_render_option()
-        render_option.background_color = np.array(background_color)
+        renderer.setup_camera(
+            self.intrinsics.to_matrix(),
+            self.get_view_matrix(),
+            self.intrinsics.width,
+            self.intrinsics.height,
+        )
 
         # Render and capture
-        vis.poll_events()
-        vis.update_renderer()
+        image = renderer.render_to_image()
 
-        # Capture image
-        image = vis.capture_screen_float_buffer(do_render=True)
-
-        vis.destroy_window()
-
-        return np.asarray(image)
+        # Convert to float [0, 1] to match previous behavior
+        return np.asarray(image).astype(np.float32) / 255.0
 
     def render_depth(
         self,
@@ -291,35 +280,37 @@ class VirtualCamera:
         Returns:
             Depth image as numpy array (H x W) with values in meters
         """
-        # Create visualizer in offscreen mode
-        vis = o3d.visualization.Visualizer()
-        vis.create_window(
-            width=self.intrinsics.width, height=self.intrinsics.height, visible=False
-        )
+        renderer = self._get_renderer()
+        scene = renderer.scene
+        scene.clear_geometry()
 
-        # Add geometry
-        if isinstance(geometry, list):
-            for geom in geometry:
-                vis.add_geometry(geom)
-        else:
-            vis.add_geometry(geometry)
+        # Use a default material for all geometries
+        material = o3d.visualization.rendering.MaterialRecord()
+        material.shader = "defaultLit"
+
+        # Add geometry to scene
+        geometries = geometry if isinstance(geometry, list) else [geometry]
+        for i, geom in enumerate(geometries):
+            scene.add_geometry(f"geometry_{i}", geom, material)
 
         # Set camera parameters
-        ctr = vis.get_view_control()
-        pinhole = o3d.camera.PinholeCameraParameters()
-        pinhole.intrinsic = self.intrinsics.to_pinhole_parameters()
-        pinhole.extrinsic = self.get_view_matrix()
+        renderer.setup_camera(
+            self.intrinsics.to_matrix(),
+            self.get_view_matrix(),
+            self.intrinsics.width,
+            self.intrinsics.height,
+        )
+        # Override clipping planes
+        scene.camera.set_projection(
+            self.intrinsics.to_matrix(),
+            z_near,
+            z_far,
+            self.intrinsics.width,
+            self.intrinsics.height,
+        )
 
-        ctr.convert_from_pinhole_camera_parameters(pinhole, allow_arbitrary=True)
-
-        # Render
-        vis.poll_events()
-        vis.update_renderer()
-
-        # Capture depth
-        depth = vis.capture_depth_float_buffer(do_render=True)
-
-        vis.destroy_window()
+        # Render and capture depth
+        depth = renderer.render_to_depth_image(z_in_view_space=True)
 
         return np.asarray(depth)
 
@@ -470,14 +461,8 @@ class VirtualCamera:
         # We need camera to world rotation
         R_cam_to_world = R_world_to_cam.T
 
-        # Build transformation matrix
-        T = np.eye(4)
-        T[:3, :3] = R_cam_to_world
-        T[:3, 3] = self._position
-
-        # Extract orientation from matrix
-        _, orientation = self._matrix_to_pose(T)
-        self._orientation = orientation
+        # Build rotation object from matrix
+        self._rotation = R.from_matrix(R_cam_to_world)
 
         self._update_extrinsics()
 
@@ -639,17 +624,20 @@ class VirtualCamera:
         v_lin = velocity[:3]  # Linear velocity
         v_ang = velocity[3:]  # Angular velocity
 
-        # Update position
+        # Update orientation (angular velocity)
+        rot_delta = R.from_rotvec(v_ang * dt)
         if frame == "camera":
             # Transform linear velocity from camera to world frame
-            R = self._extrinsic_matrix[:3, :3]
-            v_lin_world = R @ v_lin
+            v_lin_world = self._rotation.apply(v_lin)
             self._position += v_lin_world * dt
+
+            # Update orientation (angular velocity in camera frame)
+            self._rotation = self._rotation * rot_delta
         else:
             self._position += v_lin * dt
 
-        # Update orientation (simple Euler integration)
-        self._orientation += v_ang * dt
+            # Update orientation (angular velocity in world frame)
+            self._rotation = rot_delta * self._rotation
 
         self._update_extrinsics()
 

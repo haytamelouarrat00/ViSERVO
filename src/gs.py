@@ -116,6 +116,23 @@ class GaussianSplattingScene:
 
         self._loaded = False
 
+    def cleanup(self):
+        """
+        Clear Gaussian parameters and empty GPU cache.
+        """
+        self.means = None
+        self.scales = None
+        self.rotations = None
+        self.opacities = None
+        self.colors = None
+        self._loaded = False
+
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+
+        if self.verbose:
+            print("Scene resources cleaned up.")
+
     def load_gaussians(self, params: GaussianParameters):
         """
         Load Gaussian splat parameters into the scene.
@@ -123,6 +140,9 @@ class GaussianSplattingScene:
         Args:
             params: GaussianParameters object containing all splat data
         """
+        # Ensure previous resources are cleared
+        self.cleanup()
+
         # Convert numpy arrays to torch tensors
         self.means = torch.from_numpy(params.means).float().to(self.device)
         self.scales = torch.from_numpy(params.scales).float().to(self.device)

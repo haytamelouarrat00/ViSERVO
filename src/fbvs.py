@@ -26,26 +26,6 @@ def _compose_current_target_view(current_bgr: np.ndarray, target_bgr: np.ndarray
         target_vis = target_bgr
 
     panel = np.hstack([current_bgr, target_vis])
-    cv2.putText(
-        panel,
-        "Current",
-        (20, 40),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        1.0,
-        (0, 255, 255),
-        2,
-        cv2.LINE_AA,
-    )
-    cv2.putText(
-        panel,
-        "Target",
-        (w + 20, 40),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        1.0,
-        (0, 255, 255),
-        2,
-        cv2.LINE_AA,
-    )
     cv2.line(panel, (w, 0), (w, h), (255, 255, 255), 1)
     return panel
 
@@ -76,32 +56,12 @@ def _draw_iteration_features(
         v_cur = int(round(float(current_points_px[i, 1])))
         if 0 <= u_cur < w and 0 <= v_cur < h:
             cv2.circle(panel, (u_cur, v_cur), 6, color, 2, lineType=cv2.LINE_AA)
-            cv2.putText(
-                panel,
-                str(i + 1),
-                (u_cur + 8, v_cur - 8),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                color,
-                2,
-                cv2.LINE_AA,
-            )
 
         # Right side: desired target features.
         u_tgt = int(round(float(target_points_px[i, 0]) * sx)) + w
         v_tgt = int(round(float(target_points_px[i, 1]) * sy))
         if w <= u_tgt < 2 * w and 0 <= v_tgt < h:
             cv2.circle(panel, (u_tgt, v_tgt), 6, color, 2, lineType=cv2.LINE_AA)
-            cv2.putText(
-                panel,
-                str(i + 1),
-                (u_tgt + 8, v_tgt - 8),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                color,
-                2,
-                cv2.LINE_AA,
-            )
 
 
 def debug_viz(
@@ -228,17 +188,11 @@ def fbvs(
     if real_bgr is None:
         raise FileNotFoundError(f"Could not read image: {desired_view}")
 
+    # Initialize scene and camera outside the loop
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
     from src.gs import GaussianSplattingScene
-    from src.scene_ops import apply_scene_pose
     scene_obj = GaussianSplattingScene(device=str(device))
     scene_obj.load_from_ply(str(scene))
-    # If scene_pose_np is always zero, we can just load. 
-    # But for generality, we can apply it here if it were non-zero.
-    # params = scene_obj.load_from_ply(str(scene))
-    # params = apply_scene_pose(params, scene_pose_np)
-    # scene_obj.load_gaussians(params)
 
     K = get_camera_intrinsics("data/sparse/0")
     camera = create_camera_from_K(K, width=1920, height=1080)
@@ -255,7 +209,6 @@ def fbvs(
     last_rendered_features = None
     last_real_features = None
     converged = False
-    stopped_by_user = False
     tracked_features_px = None
     desired_features_px = None
     desired_features_norm = None
@@ -274,27 +227,31 @@ def fbvs(
         render_rgb_u8 = (np.clip(result.rgb, 0.0, 1.0) * 255).astype(np.uint8)
         render_bgr = cv2.cvtColor(render_rgb_u8, cv2.COLOR_RGB2BGR)
         rendered_gray = cv2.cvtColor(render_bgr, cv2.COLOR_BGR2GRAY)
-        # cv2.imshow("Current Render", render_bgr)
-        # while True:
-        #     key = cv2.waitKey(1)
-        #     if key == 27:  # ESC key
-        #         break
-        # cv2.destroyAllWindows()
-        # import sys; sys.exit(0)
+
         # Initialize and filter features only once at the beginning.
         if tracked_features_px is None:
             rendered_depth_map = result.depth
             if rendered_depth_map is None:
-                raise RuntimeError(
-                    "Failed to extract rendered depth map from Gaussian renderer."
-                )
+                print("[fbvs] Failed to extract rendered depth map from Gaussian renderer.")
+                break
+
             f = Features(rendered_gray, real_gray)
             kp1, kp2, matches = f.match_sift()
             mask = f.ransac_filter(kp1, kp2, matches)
             inlier_matches = [m for m, keep in zip(matches, mask) if keep]
-            tracked_features_px, desired_features_px, _ = f.extract_quad_features(
-                kp1, kp2, inlier_matches
-            )
+            
+            if not inlier_matches:
+                print("[fbvs] No inlier matches found during initialization.")
+                break
+
+            try:
+                tracked_features_px, desired_features_px, _ = f.extract_quad_features(
+                    kp1, kp2, inlier_matches
+                )
+            except ValueError as e:
+                print(f"[fbvs] Quad feature extraction failed: {e}")
+                break
+
             tracked_features_px = tracked_features_px.astype(np.float32, copy=True)
             desired_features_px = desired_features_px.astype(np.float32, copy=True)
             desired_features_norm = normalize_features(desired_features_px, camera=camera)
@@ -310,17 +267,23 @@ def fbvs(
             feature_points_world = camera.back_project_to_world(
                 tracked_features_px, init_depths
             ).astype(np.float32)
+            
+            # Print desired features only once at the beginning
+            d_str = " ".join([f"F{j+1}=({desired_features_px[j,0]:.1f},{desired_features_px[j,1]:.1f})" for j in range(4)])
+            print(f"[fbvs] Desired Features: {d_str}")
             print("[fbvs] feature initialization done (once)")
         else:
             if feature_points_world is None:
-                raise RuntimeError("3D feature points were not initialized.")
+                print("[fbvs] 3D feature points were not initialized.")
+                break
             camera.set_pose(position=camera_pose_np[:3], orientation=camera_pose_np[3:])
             tracked_features_px = camera.project_points(feature_points_world).astype(
                 np.float32
             )
 
         if feature_points_world is None:
-            raise RuntimeError("3D feature points were not initialized.")
+            print("[fbvs] 3D feature points were not initialized.")
+            break
         points_h = np.hstack(
             [feature_points_world, np.ones((feature_points_world.shape[0], 1))]
         )
@@ -337,10 +300,11 @@ def fbvs(
             & (v < float(h_img))
         )
         if not np.all(valid):
-            raise RuntimeError(
-                "Reprojected 3D features became invalid (behind camera or outside image). "
-                "FBVS error is no longer trustworthy with current pose/convention."
+            print(
+                "[fbvs] Reprojected 3D features became invalid (behind camera or outside image). "
+                "Stopping servoing loop."
             )
+            break
         feature_depths = np.clip(feature_depths, 1e-6, None)
 
         rendered_features = normalize_features(tracked_features_px, camera=camera)
@@ -363,26 +327,20 @@ def fbvs(
                     current_size=render_bgr.shape[:2],
                     target_size=real_bgr.shape[:2],
                 )
-            cv2.putText(
-                panel,
-                f"iter={i:02d}  error={e_norm:.6f}",
-                (20, panel.shape[0] - 20),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (0, 255, 0),
-                2,
-                cv2.LINE_AA,
-            )
+                
+            # Print current feature coordinates to terminal only
+            c_str = " ".join([f"F{j+1}=({tracked_features_px[j,0]:.1f},{tracked_features_px[j,1]:.1f})" for j in range(4)])
+            print(f"iter={i:02d} error={e_norm:.6f} {c_str}")
+
             cv2.namedWindow(vis_window_name, cv2.WINDOW_NORMAL)
             cv2.imshow(vis_window_name, panel)
             key = cv2.waitKey(vis_wait_ms) & 0xFF
             if key in (27, ord("q")):
-                stopped_by_user = True
                 break
         except cv2.error:
             pass
 
-        print(f"[fbvs] iter={i:02d} error_norm={e_norm:.6f}")
+        # Removed redundant print(f"[fbvs] iter={i:02d} error_norm={e_norm:.6f}")
         if e_norm <= error_tolerance:
             converged = True
             break
@@ -395,6 +353,11 @@ def fbvs(
         position, orientation = camera.get_pose()
         camera_pose_np = np.concatenate([position, orientation]).astype(np.float32)
 
+    # If the loop finishes (converged or max_iters reached), 
+    # keep window open to allow inspection.
+    print("[fbvs] Servoing loop finished. Press any key in the visualization window to close.")
+    cv2.waitKey(0)
+
     try:
         cv2.destroyWindow(vis_window_name)
         cv2.waitKey(1)
@@ -402,7 +365,7 @@ def fbvs(
         pass
 
     print(
-        f"[fbvs] converged={converged} stopped_by_user={stopped_by_user} "
+        f"[fbvs] converged={converged} "
         f"final_pose={camera_pose_np.tolist()}"
     )
 

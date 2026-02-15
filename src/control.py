@@ -27,6 +27,37 @@ def geometric_error(
 
     return error, float(error_norm)  # in pixels
 
+def ZNSSD(
+    desired_features: np.ndarray, current_features: np.ndarray
+) -> tuple[np.ndarray, float]:
+    """
+    Compute the Zero-mean Normalized Sum of Squared Differences (ZNSSD) error between the desired and current features.
+    Returns:
+        errors: An array of shape (N,) containing the per-feature ZNSSD errors.
+        mean_error: The mean ZNSSD error across all features.
+    """
+    if desired_features.shape != current_features.shape:
+        raise ValueError(
+            f"Shape mismatch: desired_features has shape {desired_features.shape}, "
+            f"but current_features has shape {current_features.shape}"
+        )
+    desired_mean = np.mean(desired_features)
+    current_mean = np.mean(current_features)
+
+    desired_zero_mean = desired_features - desired_mean
+    current_zero_mean = current_features - current_mean
+
+    numerator = np.sum((current_zero_mean - desired_zero_mean) ** 2)
+    denominator = np.sqrt(
+        np.sum(desired_zero_mean**2) * np.sum(current_zero_mean**2)
+    )
+
+    if denominator == 0:
+        raise ValueError("Denominator in ZNSSD calculation is zero.")
+
+    znssd_error = numerator / denominator
+
+    return znssd_error
 
 def normalize_features(features: np.ndarray, camera: VirtualCamera) -> np.ndarray:
     """

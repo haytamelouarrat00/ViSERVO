@@ -9,8 +9,7 @@ from src.rotations import quat_to_matrix
 def get_camera_intrinsics(colmap_model_path: str) -> np.ndarray:
     reconstruction = pycolmap.Reconstruction(colmap_model_path)
     camera = next(iter(reconstruction.cameras.values()))
-    f, cx, cy, k = camera.params
-    return np.array([[f, 0, cx], [0, f, cy], [0, 0, 1]])
+    return camera.calibration_matrix()
 
 
 def get_camera_intrinsics_and_resolution(
@@ -18,7 +17,7 @@ def get_camera_intrinsics_and_resolution(
 ) -> tuple[np.ndarray, int, int]:
     reconstruction = pycolmap.Reconstruction(colmap_model_path)
     camera = next(iter(reconstruction.cameras.values()))
-    K = get_camera_intrinsics(colmap_model_path)
+    K = camera.calibration_matrix()
     return K, int(camera.width), int(camera.height)
 
 

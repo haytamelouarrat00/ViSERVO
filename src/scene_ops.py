@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from typing import Tuple
-
+from typing import Tuple, Sequence
+from datetime import datetime
+from pathlib import Path
 import numpy as np
-
+import cv2
 from src.gs import GaussianParameters
 from src.rotations import euler_to_quaternion, quat_to_matrix
-
-
+from src.features import XFeatMatcher
 def scene_bounds(
     points: np.ndarray,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
@@ -108,3 +108,198 @@ def add_world_frame_gaussians(
         opacities=np.vstack([params.opacities, frame_opacities]).astype(np.float32),
         colors=np.vstack([params.colors, frame_colors]).astype(np.float32),
     )
+
+def debug_viz(
+    ply_path: str | Path,
+    real_image_path: str | Path,
+    camera_pose: Sequence[float],
+    *,
+    scene_pose: Sequence[float] = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+    device: str = "cuda",
+    width: int = 1920,
+    height: int = 1080,
+    fov_deg: float = 60.0,
+    near: float = 0.01,
+    far: float = 100.0,
+    include_world_frame: bool = True,
+    axis_length: float | None = None,
+    axis_samples: int = 64,
+    axis_scale: float = 0.01,
+    window_name: str = "FBVS Debug Matches",
+    wait_key_ms: int = 0,
+    camera=None,
+) -> np.ndarray:
+    """
+    Render a Gaussian-splat view, match features vs. a real image, and show matches.
+
+    Returns:
+        BGR match visualization image.
+    """
+    from src.render_pipeline import render_gaussian_view
+
+    camera_pose_np = np.asarray(camera_pose, dtype=np.float32)
+    scene_pose_np = np.asarray(scene_pose, dtype=np.float32)
+
+    real_bgr = cv2.imread(str(real_image_path), cv2.IMREAD_COLOR)
+    if real_bgr is None:
+        raise FileNotFoundError(f"Could not read image: {real_image_path}")
+
+    result = render_gaussian_view(
+        ply_path=ply_path,
+        camera_pose=camera_pose_np,
+        scene_pose=scene_pose_np,
+        device=device,
+        width=width,
+        height=height,
+        fov_deg=fov_deg,
+        near=near,
+        far=far,
+        include_world_frame=include_world_frame,
+        axis_length=axis_length,
+        axis_samples=axis_samples,
+        axis_scale=axis_scale,
+        return_alpha=False,
+        camera=camera,
+    )
+
+    render_rgb_u8 = (np.clip(result.rgb, 0.0, 1.0) * 255).astype(np.uint8)
+    render_bgr = cv2.cvtColor(render_rgb_u8, cv2.COLOR_RGB2BGR)
+
+    rendered_gray = cv2.cvtColor(render_bgr, cv2.COLOR_BGR2GRAY)
+    real_gray = cv2.cvtColor(real_bgr, cv2.COLOR_BGR2GRAY)
+
+    xfeat_matcher = XFeatMatcher()
+    match_result = xfeat_matcher.match(rendered_gray, real_gray)
+
+    match_vis = cv2.drawMatches(
+        render_bgr,
+        match_result.keypoints_ref,
+        real_bgr,
+        match_result.keypoints_qry,
+        match_result.matches,
+        None,
+        flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS,
+    )
+
+    # Display (optional blocking)
+    shown = False
+    try:
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        cv2.imshow(window_name, match_vis)
+        shown = True
+
+        if wait_key_ms <= 0:
+            while True:
+                key = cv2.waitKey(30) & 0xFF
+                if key in (27, ord("q")):
+                    break
+                try:
+                    if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
+                        break
+                except cv2.error:
+                    break
+        else:
+            cv2.waitKey(wait_key_ms)
+    except cv2.error:
+        pass
+    finally:
+        if shown:
+            cv2.destroyWindow(window_name)
+            cv2.waitKey(1)
+
+    return match_vis
+
+
+def debug_viz_mesh(
+    ply_path: str | Path,
+    real_image_path: str | Path,
+    camera_pose: np.ndarray,
+    *,
+    width: int = 1920,
+    height: int = 1080,
+    fov_deg: float = 60.0,
+    near: float = 0.01,
+    far: float = 100.0,
+    window_name: str = "FBVS Mesh Debug Matches",
+    wait_key_ms: int = 0,
+    camera=None,
+) -> np.ndarray:
+    """
+    Render a mesh view, then visualize raw XFeat matches against a real image.
+    """
+    from src.camera import create_default_camera
+    from src.mesh_scene import MeshScene
+
+    camera_pose_np = np.asarray(camera_pose, dtype=np.float32)
+
+    scene = MeshScene(verbose=False)
+    scene.load_mesh(str(ply_path))
+
+    if camera is None:
+        camera = create_default_camera(width=width, height=height, fov_deg=fov_deg)
+
+    camera.set_pose(position=camera_pose_np[:3], orientation=camera_pose_np[3:])
+
+    render_rgb = scene.render_from_virtual_camera(camera, near=near, far=far)
+    render_rgb_u8 = (np.clip(render_rgb, 0.0, 1.0) * 255).astype(np.uint8)
+    render_bgr = cv2.cvtColor(render_rgb_u8, cv2.COLOR_RGB2BGR)
+    real_bgr = cv2.imread(str(real_image_path), cv2.IMREAD_COLOR)
+    if real_bgr is None:
+        raise FileNotFoundError(f"Could not read image: {real_image_path}")
+
+    rendered_gray = cv2.cvtColor(render_bgr, cv2.COLOR_BGR2GRAY)
+    real_gray = cv2.cvtColor(real_bgr, cv2.COLOR_BGR2GRAY)
+
+    xfeat_matcher = XFeatMatcher()
+    match_result = xfeat_matcher.match(rendered_gray, real_gray)
+    match_vis = cv2.drawMatches(
+        render_bgr,
+        match_result.keypoints_ref,
+        real_bgr,
+        match_result.keypoints_qry,
+        match_result.matches,
+        None,
+        flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS,
+    )
+
+    # Display (optional blocking)
+    shown = False
+    try:
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        cv2.imshow(window_name, match_vis)
+        shown = True
+
+        if wait_key_ms <= 0:
+            while True:
+                key = cv2.waitKey(30) & 0xFF
+                if key in (27, ord("q")):
+                    break
+                try:
+                    if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
+                        break
+                except cv2.error:
+                    break
+        else:
+            cv2.waitKey(wait_key_ms)
+    except cv2.error:
+        pass
+    finally:
+        if shown:
+            cv2.destroyWindow(window_name)
+            cv2.waitKey(1)
+
+    return match_vis
+
+
+def pose6_from_T(T: np.ndarray, matrix_type: str ="w2c") -> np.ndarray:
+    from scipy.spatial.transform import Rotation as R
+    if matrix_type == "w2c":
+        T_c2w = np.linalg.inv(T)
+    elif matrix_type == "c2w":
+        T_c2w = T
+    else:
+        raise ValueError("matrix_type must be 'w2c' or 'c2w'")
+
+    pos = T_c2w[:3, 3]
+    rot = R.from_matrix(T_c2w[:3, :3]).as_euler("xyz", degrees=False)
+    return np.concatenate([pos,rot]).astype(np.float32)

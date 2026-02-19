@@ -1,4 +1,3 @@
-import pycolmap
 import numpy as np
 import cv2
 import os
@@ -6,8 +5,18 @@ import os
 from src.rotations import quat_to_matrix
 
 
+def _load_reconstruction(colmap_model_path: str):
+    try:
+        import pycolmap
+    except ImportError as exc:
+        raise ImportError(
+            "pycolmap is required for COLMAP utilities. Install with `pip install pycolmap`."
+        ) from exc
+    return pycolmap.Reconstruction(colmap_model_path)
+
+
 def get_camera_intrinsics(colmap_model_path: str) -> np.ndarray:
-    reconstruction = pycolmap.Reconstruction(colmap_model_path)
+    reconstruction = _load_reconstruction(colmap_model_path)
     camera = next(iter(reconstruction.cameras.values()))
     return camera.calibration_matrix()
 
@@ -15,7 +24,7 @@ def get_camera_intrinsics(colmap_model_path: str) -> np.ndarray:
 def get_camera_intrinsics_and_resolution(
     colmap_model_path: str,
 ) -> tuple[np.ndarray, int, int]:
-    reconstruction = pycolmap.Reconstruction(colmap_model_path)
+    reconstruction = _load_reconstruction(colmap_model_path)
     camera = next(iter(reconstruction.cameras.values()))
     K = camera.calibration_matrix()
     return K, int(camera.width), int(camera.height)
@@ -26,7 +35,7 @@ def qvec_to_rotmat(qvec):
 
 
 def get_camera_pose(colmap_model_path: str, image_path: str) -> np.ndarray:
-    reconstruction = pycolmap.Reconstruction(colmap_model_path)
+    reconstruction = _load_reconstruction(colmap_model_path)
     image_name = os.path.basename(image_path)
     image = next(
         (img for img in reconstruction.images.values() if img.name == image_name),

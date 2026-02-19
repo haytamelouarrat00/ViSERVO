@@ -27,6 +27,7 @@ def geometric_error(
 
     return error, float(error_norm)  # in pixels
 
+
 def ZNSSD(
     desired_features: np.ndarray, current_features: np.ndarray
 ) -> tuple[np.ndarray, float]:
@@ -48,9 +49,7 @@ def ZNSSD(
     current_zero_mean = current_features - current_mean
 
     numerator = np.sum((current_zero_mean - desired_zero_mean) ** 2)
-    denominator = np.sqrt(
-        np.sum(desired_zero_mean**2) * np.sum(current_zero_mean**2)
-    )
+    denominator = np.sqrt(np.sum(desired_zero_mean**2) * np.sum(current_zero_mean**2))
 
     if denominator == 0:
         raise ValueError("Denominator in ZNSSD calculation is zero.")
@@ -58,6 +57,7 @@ def ZNSSD(
     znssd_error = numerator / denominator
 
     return znssd_error
+
 
 def normalize_features(features: np.ndarray, camera: VirtualCamera) -> np.ndarray:
     """
@@ -128,6 +128,11 @@ def velocity(L: np.ndarray, error: np.ndarray, gain: float = 1.0) -> np.ndarray:
     Returns:
         Camera velocity command as a vector of shape (6,).
     """
+    L = np.asarray(L, dtype=np.float64)
+    error = np.asarray(error, dtype=np.float64).reshape(-1)
+
+    if L.ndim != 2:
+        raise ValueError(f"Expected L to be a 2D matrix, got shape {L.shape}")
     if L.shape[0] != error.shape[0]:
         raise ValueError(
             f"Row mismatch: L has {L.shape[0]} rows but error has {error.shape[0]} elements"
@@ -137,5 +142,5 @@ def velocity(L: np.ndarray, error: np.ndarray, gain: float = 1.0) -> np.ndarray:
 
     # Compute the pseudo-inverse of L
     L_pinv = np.linalg.pinv(L)
-    v = -gain * (L_pinv @ error)
-    return v.astype(np.float32)
+    v = -float(gain) * (L_pinv @ error)
+    return np.asarray(v, dtype=np.float32).reshape(6)

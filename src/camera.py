@@ -10,87 +10,321 @@ import sys
 from pathlib import Path
 
 import numpy as np
-import open3d as o3d
+
+try:
+    import open3d as o3d
+
+    OPEN3D_AVAILABLE = True
+except ImportError:
+    OPEN3D_AVAILABLE = False
 from scipy.spatial.transform import Rotation as R
 from typing import Any, Tuple, Optional, Union
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from scipy.linalg import expm
 
+def _as_vector(x: np.ndarray, size: int, name: str) -> np.ndarray:
+    """Convert input to a flat vector with a fixed number of elements."""
+    x_arr = np.asarray(x, dtype=float)
+    if x_arr.size != size:
+        raise ValueError(f"{name} must have {size} elements, got shape {x_arr.shape}")
+    return x_arr.reshape(size)
+
+
+def _se3_exp(xi: np.ndarray) -> np.ndarray:
+    """
+    Compute the SE(3) exponential map: exp(ξ^).
+
+    Converts a 6D twist (element of se(3) Lie algebra) to a 4x4
+    homogeneous transformation matrix (element of SE(3) Lie group).
+
+    Args:
+        xi: 6D twist vector [vx, vy, vz, wx, wy, wz]
+
+    Returns:
+        4x4 homogeneous transformation matrix in SE(3)
+
+    Reference:
+        "A Mathematical Introduction to Robotic Manipulation"
+        Murray, Li, Sastry (1994), Chapter 2
+    """
+    xi = _as_vector(xi, size=6, name="xi")
+    v = xi[:3]  # Linear velocity
+    w = xi[3:]  # Angular velocity (rotation vector)
+
+    theta = np.linalg.norm(w)  # Rotation angle
+
+    if theta < 1e-8:
+        # Pure translation (or small rotation): use first-order approximation
+        T = np.eye(4)
+        T[:3, 3] = v
+        return T
+
+    # Normalize rotation axis
+    w_normalized = w / theta
+
+    # Compute SO(3) exponential (Rodriguez formula)
+    w_hat = _skew_symmetric(w_normalized)
+    R_matrix = (
+        np.eye(3)
+        + np.sin(theta) * w_hat
+        + (1 - np.cos(theta)) * (w_hat @ w_hat)
+    )
+
+    # Compute translation part using the SE(3) formula
+    # p = (I - R) * (w × v) + w * (w^T * v) * theta
+    # Or equivalently: p = V * v where V is defined below
+    V = (
+        np.eye(3) * theta
+        + (1 - np.cos(theta)) * w_hat
+        + (theta - np.sin(theta)) * (w_hat @ w_hat)
+    ) / theta
+
+    p = V @ v
+
+    # Construct SE(3) matrix
+    T = np.eye(4)
+    T[:3, :3] = R_matrix
+    T[:3, 3] = p
+
+    return T
+
+
+def _se3_exp_scipy(xi: np.ndarray) -> np.ndarray:
+    """
+    Alternative implementation using scipy.linalg.expm on the matrix representation.
+
+    This is simpler but potentially slower than the analytical formula.
+
+    Args:
+        xi: 6D twist vector [vx, vy, vz, wx, wy, wz]
+
+    Returns:
+        4x4 homogeneous transformation matrix in SE(3)
+    """
+    # Convert twist to 4x4 matrix representation (se(3) matrix)
+    xi_hat = _se3_hat(xi)
+
+    # Compute matrix exponential
+    return expm(xi_hat)
+
+
+def _se3_hat(xi: np.ndarray) -> np.ndarray:
+    """
+    Convert 6D twist vector to its 4x4 matrix representation (hat operator).
+
+    Args:
+        xi: 6D twist vector [vx, vy, vz, wx, wy, wz]
+
+    Returns:
+        4x4 matrix in se(3) algebra:
+        [w^  v]
+        [0   0]
+        where w^ is the skew-symmetric matrix of angular velocity
+    """
+    xi = _as_vector(xi, size=6, name="xi")
+    v = xi[:3]
+    w = xi[3:]
+
+    xi_hat = np.zeros((4, 4))
+    xi_hat[:3, :3] = _skew_symmetric(w)
+    xi_hat[:3, 3] = v
+
+    return xi_hat
+
+
+def _skew_symmetric(w: np.ndarray) -> np.ndarray:
+    """
+    Convert 3D vector to its skew-symmetric matrix (hat operator for so(3)).
+
+    Args:
+        w: 3D vector [wx, wy, wz]
+
+    Returns:
+        3x3 skew-symmetric matrix:
+        [ 0   -wz   wy]
+        [ wz   0   -wx]
+        [-wy   wx   0 ]
+    """
+    w = _as_vector(w, size=3, name="w")
+    wx, wy, wz = w
+    return np.array(
+        [
+            [0.0, -wz, wy],
+            [wz, 0.0, -wx],
+            [-wy, wx, 0.0],
+        ]
+    )
 
 @dataclass
 class CameraIntrinsics:
     """
     Camera intrinsic parameters for pinhole camera model.
     All units are in pixels unless otherwise specified.
+
+    The primary way to construct this class is via a 3x3 intrinsic matrix K:
+
+        K = [[fx,  0, cx],
+             [ 0, fy, cy],
+             [ 0,  0,  1]]
+
+    Use `CameraIntrinsics.from_K(width, height, K)` or the convenience constructor
+    `CameraIntrinsics(width, height, K)` which accepts K directly.
     """
 
     width: int  # Image width (pixels)
     height: int  # Image height (pixels)
-    fx: float  # Focal length in x (pixels)
-    fy: float  # Focal length in y (pixels)
-    cx: float  # Principal point x (pixels)
-    cy: float  # Principal point y (pixels)
+    K: np.ndarray = field(default=None)  # 3x3 intrinsic matrix (primary representation)
 
+    def __post_init__(self):
+        if self.K is None:
+            # Default: identity-like K with principal point at image centre and f=1
+            self.K = np.array(
+                [
+                    [1.0, 0.0, self.width / 2.0],
+                    [0.0, 1.0, self.height / 2.0],
+                    [0.0, 0.0, 1.0],
+                ]
+            )
+        else:
+            self.K = self._validated_K(self.K)
+
+    # ------------------------------------------------------------------
+    # Validation
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _validated_K(K: np.ndarray) -> np.ndarray:
+        K = np.asarray(K, dtype=float)
+        if K.shape != (3, 3):
+            raise ValueError(f"Intrinsic matrix K must be 3x3, got {K.shape}")
+        if not np.isclose(K[2, 2], 1.0):
+            raise ValueError(f"K[2,2] must be 1, got {K[2, 2]}")
+        return K.copy()
+
+    # ------------------------------------------------------------------
+    # Derived scalar properties (read from K on the fly)
+    # ------------------------------------------------------------------
+    @property
+    def fx(self) -> float:
+        return float(self.K[0, 0])
+
+    @property
+    def fy(self) -> float:
+        return float(self.K[1, 1])
+
+    @property
+    def cx(self) -> float:
+        return float(self.K[0, 2])
+
+    @property
+    def cy(self) -> float:
+        return float(self.K[1, 2])
+
+    # ------------------------------------------------------------------
+    # Constructors
+    # ------------------------------------------------------------------
+    @classmethod
+    def from_K(cls, width: int, height: int, K: np.ndarray) -> "CameraIntrinsics":
+        """Create CameraIntrinsics from image size and a 3x3 intrinsic matrix K."""
+        return cls(width=width, height=height, K=K)
+
+    @classmethod
+    def from_fov(
+        cls,
+        width: int,
+        height: int,
+        fov_deg: float = 60.0,
+        axis: str = "vertical",
+    ) -> "CameraIntrinsics":
+        """
+        Create CameraIntrinsics from a field-of-view angle.
+
+        Args:
+            width:   Image width in pixels.
+            height:  Image height in pixels.
+            fov_deg: Field-of-view angle in degrees.
+            axis:    Whether `fov_deg` describes the 'vertical' or 'horizontal' FOV.
+        """
+        fov_rad = np.deg2rad(fov_deg)
+        if axis == "vertical":
+            fy = height / (2.0 * np.tan(fov_rad / 2.0))
+            fx = fy
+        elif axis == "horizontal":
+            fx = width / (2.0 * np.tan(fov_rad / 2.0))
+            fy = fx
+        else:
+            raise ValueError(f"axis must be 'vertical' or 'horizontal', got '{axis}'")
+
+        cx = width / 2.0
+        cy = height / 2.0
+
+        K = np.array(
+            [
+                [fx, 0.0, cx],
+                [0.0, fy, cy],
+                [0.0, 0.0, 1.0],
+            ]
+        )
+        return cls(width=width, height=height, K=K)
+
+    # ------------------------------------------------------------------
+    # Conversion helpers
+    # ------------------------------------------------------------------
     def to_matrix(self) -> np.ndarray:
-        """Convert to 3x3 intrinsic matrix K."""
-        return np.array([[self.fx, 0, self.cx], [0, self.fy, self.cy], [0, 0, 1]])
+        """Return a copy of the 3x3 intrinsic matrix K."""
+        return self.K.copy()
 
-    def to_pinhole_parameters(self) -> o3d.camera.PinholeCameraIntrinsic:
+    def to_pinhole_parameters(self) -> Any:
         """Convert to Open3D PinholeCameraIntrinsic object."""
+        if not OPEN3D_AVAILABLE:
+            raise ImportError("Open3D is not available.")
         intrinsic = o3d.camera.PinholeCameraIntrinsic()
         intrinsic.set_intrinsics(
             self.width, self.height, self.fx, self.fy, self.cx, self.cy
         )
         return intrinsic
 
-    def set_intrinsics_from_K(self, K: np.ndarray) -> None:
-        """Set fx/fy/cx/cy from a 3x3 intrinsic matrix K."""
-        K = np.asarray(K, dtype=float)
-        if K.shape != (3, 3):
-            raise ValueError(f"Intrinsic matrix K must be 3x3, got {K.shape}")
-        if not np.isclose(K[2, 2], 1.0):
-            raise ValueError(f"K[2,2] must be 1, got {K[2,2]}")
-        self.fx = float(K[0, 0])
-        self.fy = float(K[1, 1])
-        self.cx = float(K[0, 2])
-        self.cy = float(K[1, 2])
-
-    @classmethod
-    def from_K(cls, width: int, height: int, K: np.ndarray) -> "CameraIntrinsics":
-        """Create CameraIntrinsics from image size and a 3x3 intrinsic matrix K."""
-        intrinsics = cls(
-            width=width,
-            height=height,
-            fx=1.0,
-            fy=1.0,
-            cx=width / 2.0,
-            cy=height / 2.0,
-        )
-        intrinsics.set_intrinsics_from_K(K)
-        return intrinsics
+    def set_K(self, K: np.ndarray) -> None:
+        """Replace the intrinsic matrix with a new validated K."""
+        self.K = self._validated_K(K)
 
 
 class VirtualCamera:
     """
     A minimalistic virtual camera class for Open3D scene rendering.
 
+    The canonical way to create a camera is to supply a 3x3 intrinsic matrix K:
+
+        K = np.array([[fx, 0, cx],
+                      [0, fy, cy],
+                      [0,  0,  1]])
+        cam = VirtualCamera.from_K(K, width=1920, height=1080)
+
+    or use the top-level factory:
+
+        cam = create_camera_from_K(K, width=1920, height=1080)
+
     Features:
     - 6DOF pose representation (x, y, z, pitch, roll, yaw)
-    - Pinhole camera model with intrinsic parameters
+    - Pinhole camera model with intrinsic matrix as the primary representation
     - Scene rendering from camera viewpoint
     - Clean API for visual servoing integration
     """
 
     def __init__(self, intrinsics: CameraIntrinsics):
         """
-        Initialize virtual camera with intrinsic parameters.
+        Initialize virtual camera with a CameraIntrinsics object.
+
+        Prefer constructing via `VirtualCamera.from_K(...)` or the module-level
+        `create_camera_from_K(...)` factory rather than building CameraIntrinsics
+        manually.
 
         Args:
-            intrinsics: CameraIntrinsics object containing camera parameters
+            intrinsics: CameraIntrinsics built from a K matrix.
         """
         self.intrinsics = intrinsics
 
         # Initialize pose: position (x, y, z) and orientation (scipy Rotation)
-        self._position = np.array([0.0, 0.0, 0.0])  # meters
+        self._position = np.array([0.0, 0.0, 0.0])  # metres
         self._rotation = R.from_euler("xyz", [0.0, 0.0, 0.0])
 
         # Cache transformation matrix
@@ -99,8 +333,59 @@ class VirtualCamera:
         # Persistent renderer to avoid window creation overhead
         self._renderer = None
 
-    def _get_renderer(self) -> o3d.visualization.rendering.OffscreenRenderer:
+    # ------------------------------------------------------------------
+    # Alternate constructors (K-first API)
+    # ------------------------------------------------------------------
+    @classmethod
+    def from_K(cls, K: np.ndarray, width: int, height: int) -> "VirtualCamera":
+        """
+        Create a VirtualCamera directly from a 3x3 intrinsic matrix K.
+
+        Args:
+            K:      3x3 intrinsic matrix.
+            width:  Image width in pixels.
+            height: Image height in pixels.
+
+        Returns:
+            VirtualCamera instance.
+        """
+        intrinsics = CameraIntrinsics.from_K(width=width, height=height, K=K)
+        return cls(intrinsics)
+
+    @classmethod
+    def from_fov(
+        cls,
+        width: int = 1920,
+        height: int = 1080,
+        fov_deg: float = 60.0,
+        axis: str = "vertical",
+    ) -> "VirtualCamera":
+        """
+        Create a VirtualCamera from a field-of-view angle.
+
+        Internally this builds a K matrix and delegates to `from_K`.
+
+        Args:
+            width:   Image width in pixels.
+            height:  Image height in pixels.
+            fov_deg: Field-of-view in degrees.
+            axis:    'vertical' or 'horizontal'.
+
+        Returns:
+            VirtualCamera instance.
+        """
+        intrinsics = CameraIntrinsics.from_fov(
+            width=width, height=height, fov_deg=fov_deg, axis=axis
+        )
+        return cls(intrinsics)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+    def _get_renderer(self) -> Any:
         """Lazy initialization of the offscreen renderer."""
+        if not OPEN3D_AVAILABLE:
+            raise ImportError("Open3D is not available.")
         if self._renderer is None:
             self._renderer = o3d.visualization.rendering.OffscreenRenderer(
                 self.intrinsics.width, self.intrinsics.height
@@ -124,26 +409,25 @@ class VirtualCamera:
         """Set internal rotation from Euler angles."""
         self._rotation = R.from_euler("xyz", value)
 
+    # ------------------------------------------------------------------
+    # Pose helpers (static)
+    # ------------------------------------------------------------------
     @staticmethod
     def _pose_to_matrix(position: np.ndarray, orientation: np.ndarray) -> np.ndarray:
         """
         Convert 6DOF pose to 4x4 transformation matrix.
 
         Args:
-            position: [x, y, z] position vector
+            position:    [x, y, z] position vector
             orientation: [pitch, roll, yaw] Euler angles in radians
 
         Returns:
             4x4 homogeneous transformation matrix (camera-to-world)
         """
-        # Use intrinsic 'xyz' order for [pitch, roll, yaw]
         rot = R.from_euler("xyz", orientation)
-
-        # Build 4x4 transformation matrix
         T = np.eye(4)
         T[:3, :3] = rot.as_matrix()
         T[:3, 3] = position
-
         return T
 
     @staticmethod
@@ -158,14 +442,13 @@ class VirtualCamera:
             Tuple of (position, orientation) where orientation is [pitch, roll, yaw]
         """
         position = matrix[:3, 3]
-        rot_matrix = matrix[:3, :3]
-
-        # Use intrinsic 'xyz' order for [pitch, roll, yaw]
-        rot = R.from_matrix(rot_matrix)
+        rot = R.from_matrix(matrix[:3, :3])
         orientation = rot.as_euler("xyz")
-
         return position, orientation
 
+    # ------------------------------------------------------------------
+    # Public pose API
+    # ------------------------------------------------------------------
     def set_pose(
         self,
         position: Optional[np.ndarray] = None,
@@ -175,15 +458,13 @@ class VirtualCamera:
         Set camera pose.
 
         Args:
-            position: [x, y, z] position in meters (None to keep current)
+            position:    [x, y, z] position in metres (None to keep current)
             orientation: [pitch, roll, yaw] in radians (None to keep current)
         """
         if position is not None:
             self._position = np.array(position, dtype=float)
-
         if orientation is not None:
             self._orientation = np.array(orientation, dtype=float)
-
         self._update_extrinsics()
 
     def get_pose(self) -> Tuple[np.ndarray, np.ndarray]:
@@ -191,13 +472,12 @@ class VirtualCamera:
         Get current camera pose.
 
         Returns:
-            Tuple of (position, orientation) where:
-            - position: [x, y, z] in meters
-            - orientation: [pitch, roll, yaw] in radians
+            Tuple of (position [x,y,z], orientation [pitch,roll,yaw]).
         """
         return self._position.copy(), self._orientation.copy()
 
     def get_K(self) -> np.ndarray:
+        """Return the 3x3 intrinsic matrix K."""
         return self.intrinsics.to_matrix()
 
     def get_extrinsic_matrix(self) -> np.ndarray:
@@ -218,54 +498,51 @@ class VirtualCamera:
         """
         return np.linalg.inv(self._extrinsic_matrix)
 
+    # ------------------------------------------------------------------
+    # Rendering
+    # ------------------------------------------------------------------
     def render_rgb(
         self,
-        geometry: Union[o3d.geometry.Geometry, list],
+        geometry: Any,
         background_color: Tuple[float, float, float] = (1.0, 1.0, 1.0),
     ) -> np.ndarray:
         """
         Render RGB image from current camera pose.
 
         Args:
-            geometry: Open3D geometry object(s) to render (mesh, point cloud, etc.)
-            background_color: RGB background color (0-1 range)
+            geometry:         Open3D geometry object(s) to render.
+            background_color: RGB background color (0-1 range).
 
         Returns:
-            RGB image as numpy array (H x W x 3) with values in [0, 1]
+            RGB image as numpy array (H x W x 3) with values in [0, 1].
         """
+        if not OPEN3D_AVAILABLE:
+            raise ImportError("Open3D is not available.")
         renderer = self._get_renderer()
         scene = renderer.scene
         scene.clear_geometry()
-
-        # Set background color
         scene.set_background(np.array([*background_color, 1.0]))
 
-        # Use a default material for all geometries
         material = o3d.visualization.rendering.MaterialRecord()
         material.shader = "defaultLit"
 
-        # Add geometry to scene
         geometries = geometry if isinstance(geometry, list) else [geometry]
         for i, geom in enumerate(geometries):
             scene.add_geometry(f"geometry_{i}", geom, material)
 
-        # Set camera parameters
         renderer.setup_camera(
-            self.intrinsics.to_matrix(),
+            self.get_K(),
             self.get_view_matrix(),
             self.intrinsics.width,
             self.intrinsics.height,
         )
 
-        # Render and capture
         image = renderer.render_to_image()
-
-        # Convert to float [0, 1] to match previous behavior
         return np.asarray(image).astype(np.float32) / 255.0
 
     def render_depth(
         self,
-        geometry: Union[o3d.geometry.Geometry, list],
+        geometry: Any,
         z_near: float = 0.1,
         z_far: float = 10.0,
     ) -> np.ndarray:
@@ -273,70 +550,60 @@ class VirtualCamera:
         Render depth image from current camera pose.
 
         Args:
-            geometry: Open3D geometry object(s) to render
-            z_near: Near clipping plane distance
-            z_far: Far clipping plane distance
+            geometry: Open3D geometry object(s) to render.
+            z_near:   Near clipping plane distance.
+            z_far:    Far clipping plane distance.
 
         Returns:
-            Depth image as numpy array (H x W) with values in meters
+            Depth image as numpy array (H x W) with values in metres.
         """
+        if not OPEN3D_AVAILABLE:
+            raise ImportError("Open3D is not available.")
         renderer = self._get_renderer()
         scene = renderer.scene
         scene.clear_geometry()
 
-        # Use a default material for all geometries
         material = o3d.visualization.rendering.MaterialRecord()
         material.shader = "defaultLit"
 
-        # Add geometry to scene
         geometries = geometry if isinstance(geometry, list) else [geometry]
         for i, geom in enumerate(geometries):
             scene.add_geometry(f"geometry_{i}", geom, material)
 
-        # Set camera parameters
         renderer.setup_camera(
-            self.intrinsics.to_matrix(),
+            self.get_K(),
             self.get_view_matrix(),
             self.intrinsics.width,
             self.intrinsics.height,
         )
-        # Override clipping planes
         scene.camera.set_projection(
-            self.intrinsics.to_matrix(),
+            self.get_K(),
             z_near,
             z_far,
             self.intrinsics.width,
             self.intrinsics.height,
         )
 
-        # Render and capture depth
         depth = renderer.render_to_depth_image(z_in_view_space=True)
-
         return np.asarray(depth)
 
+    # ------------------------------------------------------------------
+    # Projection
+    # ------------------------------------------------------------------
     def project_points(self, points_3d: np.ndarray) -> np.ndarray:
         """
         Project 3D points to 2D image coordinates using pinhole model.
 
         Args:
-            points_3d: Nx3 array of 3D points in world coordinates
+            points_3d: Nx3 array of 3D points in world coordinates.
 
         Returns:
-            Nx2 array of 2D pixel coordinates
+            Nx2 array of 2D pixel coordinates.
         """
-        # Transform points to camera coordinates
         points_homogeneous = np.hstack([points_3d, np.ones((points_3d.shape[0], 1))])
-        view_matrix = self.get_view_matrix()
-        points_camera = (view_matrix @ points_homogeneous.T).T
-
-        # Project to image plane
-        K = self.intrinsics.to_matrix()
-        points_2d_homogeneous = (K @ points_camera[:, :3].T).T
-
-        # Normalize by depth
-        points_2d = points_2d_homogeneous[:, :2] / points_2d_homogeneous[:, 2:3]
-
-        return points_2d
+        points_camera = (self.get_view_matrix() @ points_homogeneous.T).T
+        points_2d_h = (self.get_K() @ points_camera[:, :3].T).T
+        return points_2d_h[:, :2] / points_2d_h[:, 2:3]
 
     def back_project_points(
         self, points_2d: np.ndarray, depths: np.ndarray
@@ -344,25 +611,13 @@ class VirtualCamera:
         """
         Back-project 2D image coordinates to 3D points in camera frame.
 
-        This is the inverse operation of project_points. Given pixel coordinates
-        and corresponding depth values, it reconstructs the 3D points in the
-        camera coordinate frame.
-
         Args:
-            points_2d: Nx2 array of 2D pixel coordinates [u, v]
-            depths: N array of depth values (Z coordinates in camera frame) in meters
+            points_2d: Nx2 array of pixel coordinates [u, v].
+            depths:    N array of depth values (Z in camera frame) in metres.
 
         Returns:
-            Nx3 array of 3D points in camera frame coordinates [X, Y, Z]
-
-        Example:
-            # Given pixel coordinates and depth map
-            pixels = np.array([[320, 240], [400, 300]])
-            depths = np.array([1.5, 2.0])
-            points_3d_cam = camera.back_project_points(pixels, depths)
-            # points_3d_cam now contains [X, Y, Z] in camera coordinates
+            Nx3 array of 3D points in camera frame coordinates [X, Y, Z].
         """
-        # Ensure inputs are numpy arrays
         points_2d = np.atleast_2d(points_2d)
         depths = np.atleast_1d(depths)
 
@@ -372,22 +627,10 @@ class VirtualCamera:
                 f"number of depth values ({depths.shape[0]})"
             )
 
-        # Get intrinsic matrix and compute its inverse
-        K = self.intrinsics.to_matrix()
-        K_inv = np.linalg.inv(K)
-
-        # Convert pixel coordinates to homogeneous coordinates
-        points_2d_homogeneous = np.hstack([points_2d, np.ones((points_2d.shape[0], 1))])
-
-        # Back-project to normalized image coordinates
-        # [X/Z, Y/Z, 1] = K^-1 @ [u, v, 1]
-        normalized_coords = (K_inv @ points_2d_homogeneous.T).T
-
-        # Scale by depth to get 3D coordinates in camera frame
-        # [X, Y, Z] = Z * [X/Z, Y/Z, 1]
-        points_3d_camera = normalized_coords * depths[:, np.newaxis]
-
-        return points_3d_camera
+        K_inv = np.linalg.inv(self.get_K())
+        points_2d_h = np.hstack([points_2d, np.ones((points_2d.shape[0], 1))])
+        normalized = (K_inv @ points_2d_h.T).T
+        return normalized * depths[:, np.newaxis]
 
     def back_project_to_world(
         self, points_2d: np.ndarray, depths: np.ndarray
@@ -395,77 +638,107 @@ class VirtualCamera:
         """
         Back-project 2D image coordinates to 3D points in world frame.
 
-        This combines back-projection to camera frame with transformation to world frame.
-
         Args:
-            points_2d: Nx2 array of 2D pixel coordinates [u, v]
-            depths: N array of depth values (Z coordinates in camera frame) in meters
+            points_2d: Nx2 array of pixel coordinates [u, v].
+            depths:    N array of depth values in metres.
 
         Returns:
-            Nx3 array of 3D points in world frame coordinates
-
-        Example:
-            # Back-project pixels to world coordinates
-            pixels = np.array([[320, 240]])
-            depths = np.array([2.0])
-            world_points = camera.back_project_to_world(pixels, depths)
+            Nx3 array of 3D points in world frame coordinates.
         """
-        # First back-project to camera frame
         points_camera = self.back_project_points(points_2d, depths)
+        points_h = np.hstack([points_camera, np.ones((points_camera.shape[0], 1))])
+        return (self.get_extrinsic_matrix() @ points_h.T).T[:, :3]
 
-        # Transform to world frame
-        extrinsic = self.get_extrinsic_matrix()
-        points_homogeneous = np.hstack(
-            [points_camera, np.ones((points_camera.shape[0], 1))]
-        )
-        points_world = (extrinsic @ points_homogeneous.T).T[:, :3]
-
-        return points_world
-
+    # ------------------------------------------------------------------
+    # Orientation helpers
+    # ------------------------------------------------------------------
     def look_at(self, target: np.ndarray, up: np.ndarray = np.array([0, 0, 1])):
         """
         Orient camera to look at a target point.
 
         Args:
-            target: [x, y, z] target point in world coordinates
-            up: [x, y, z] up vector (default: z-axis)
+            target: [x, y, z] target point in world coordinates.
+            up:     [x, y, z] up vector (default: z-axis).
         """
-        # Compute forward direction (camera +Z points toward the target)
         forward = np.asarray(target, dtype=float) - self._position
-        forward_norm = np.linalg.norm(forward)
-        if forward_norm < 1e-12:
+        norm = np.linalg.norm(forward)
+        if norm < 1e-12:
             raise ValueError("Target must be different from camera position")
-        forward = forward / forward_norm
+        forward /= norm
 
-        # Normalize up and avoid a degenerate basis when up is collinear with forward
         up = np.asarray(up, dtype=float)
         up_norm = np.linalg.norm(up)
         if up_norm < 1e-12:
             raise ValueError("Up vector must be non-zero")
-        up = up / up_norm
+        up /= up_norm
 
         if np.abs(np.dot(forward, up)) > 1.0 - 1e-6:
             up = np.array([0.0, 1.0, 0.0])
             if np.abs(np.dot(forward, up)) > 1.0 - 1e-6:
                 up = np.array([1.0, 0.0, 0.0])
 
-        # Build an orthonormal right-handed camera basis with +Z = forward
         right = np.cross(up, forward)
-        right = right / np.linalg.norm(right)
+        right /= np.linalg.norm(right)
         up_corrected = np.cross(forward, right)
-        up_corrected = up_corrected / np.linalg.norm(up_corrected)
+        up_corrected /= np.linalg.norm(up_corrected)
 
-        # Build rotation matrix (world to camera)
         R_world_to_cam = np.vstack([right, up_corrected, forward])
-
-        # We need camera to world rotation
-        R_cam_to_world = R_world_to_cam.T
-
-        # Build rotation object from matrix
-        self._rotation = R.from_matrix(R_cam_to_world)
-
+        self._rotation = R.from_matrix(R_world_to_cam.T)
         self._update_extrinsics()
 
+    # ------------------------------------------------------------------
+    # Motion
+    # ------------------------------------------------------------------
+    def apply_velocity(
+        self, velocity: np.ndarray, dt: float = 1.0, frame: str = "world"
+    ) -> None:
+        """
+            Update camera pose by applying a 6D velocity (velocity) using proper SE(3) exponential map.
+
+            This method integrates the velocity as a single SE(3) element rather than
+            separately updating translation and rotation, which properly accounts for
+            the coupling between linear and angular motion (screw motion).
+
+            Args:
+                velocity: 6D velocity [vx, vy, vz, wx, wy, wz] where:
+                       - [vx, vy, vz]: linear velocity (m/s)
+                       - [wx, wy, wz]: angular velocity (rad/s)
+                dt:    Time step in seconds
+                frame: Reference frame: 'world' or 'camera'
+                       - 'world': velocity is expressed in world frame
+                       - 'camera': velocity is expressed in camera body frame
+    """
+        velocity = _as_vector(velocity, size=6, name="velocity")
+        if frame not in {"world", "camera"}:
+            raise ValueError(f"frame must be 'world' or 'camera', got '{frame}'")
+
+        # Scale velocity by time step
+        xi = velocity * float(dt)  # ξ ∈ se(3)
+
+        # Compute SE(3) exponential map: exp(ξ^) where ξ^ is the 4x4 matrix representation
+        T_delta = _se3_exp(xi)
+
+        # Current pose as SE(3) matrix
+        T_current = self.get_extrinsic_matrix()
+
+        # Apply update based on frame
+        if frame == "camera":
+            # Body-frame velocity: T_new = T_current @ exp(ξ^)
+            T_new = T_current @ T_delta
+        else:
+            # World-frame velocity: T_new = exp(ξ^) @ T_current
+            T_new = T_delta @ T_current
+
+        # Extract position and orientation from updated transformation
+        self._position = T_new[:3, 3].copy()
+        self._rotation = R.from_matrix(T_new[:3, :3])
+
+        # Update cached extrinsic matrix
+        self._update_extrinsics()
+
+    # ------------------------------------------------------------------
+    # Depth estimation (MoGe)
+    # ------------------------------------------------------------------
     def render_depth_MoGe(
         self,
         image: Union[np.ndarray, str, Path],
@@ -482,21 +755,18 @@ class VirtualCamera:
         Estimate a depth map from a single RGB image using MoGe.
 
         Args:
-            image: Input RGB image as HxWx3 numpy array, or an image file path.
-            model: Optional preloaded MoGe model with an `infer(...)` method.
-                   If None, the model is loaded from `model_version` and
-                   `pretrained_model_name_or_path`.
-            model_version: MoGe model version, either "v1" or "v2".
-            pretrained_model_name_or_path: Hugging Face model name or local path.
-                                           If None, a default model is used.
-            device_name: Torch device string (e.g., "cpu", "cuda", "cuda:0").
-            use_fp16: Whether to use fp16 inference.
-            resolution_level: MoGe inference resolution level [0-9].
-            num_tokens: Optional explicit number of inference tokens.
-            fov_x: Optional horizontal field of view in degrees.
+            image:                          HxWx3 numpy array or file path.
+            model:                          Optional preloaded MoGe model.
+            model_version:                  'v1' or 'v2'.
+            pretrained_model_name_or_path:  HuggingFace name or local path.
+            device_name:                    Torch device string.
+            use_fp16:                       Use fp16 inference.
+            resolution_level:               MoGe resolution level [0-9].
+            num_tokens:                     Optional explicit token count.
+            fov_x:                          Optional horizontal FOV in degrees.
 
         Returns:
-            Depth map as HxW float32 numpy array in meters.
+            Depth map as HxW float32 numpy array in metres.
         """
         import torch
 
@@ -505,28 +775,23 @@ class VirtualCamera:
                 import cv2
             except ImportError as exc:
                 raise ImportError(
-                    "opencv-python is required when image is provided as a file path"
+                    "opencv-python is required when image is a file path"
                 ) from exc
-
-            image_path = Path(image)
-            bgr = cv2.imread(str(image_path))
+            bgr = cv2.imread(str(image))
             if bgr is None:
-                raise FileNotFoundError(f"Could not read image file: {image_path}")
+                raise FileNotFoundError(f"Could not read image: {image}")
             image_rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         else:
             image_rgb = np.asarray(image)
 
         if image_rgb.ndim != 3 or image_rgb.shape[2] != 3:
             raise ValueError(
-                "Input image must have shape (H, W, 3) in RGB format, "
-                f"got {image_rgb.shape}"
+                f"Input image must be (H, W, 3) RGB, got {image_rgb.shape}"
             )
 
-        image_normalized = image_rgb.astype(np.float32)
-        if np.issubdtype(image_rgb.dtype, np.integer):
-            image_normalized = image_normalized / 255.0
-        elif image_normalized.max(initial=0.0) > 1.0:
-            image_normalized = image_normalized / 255.0
+        img = image_rgb.astype(np.float32)
+        if np.issubdtype(image_rgb.dtype, np.integer) or img.max() > 1.0:
+            img /= 255.0
 
         device = torch.device(device_name)
 
@@ -534,29 +799,27 @@ class VirtualCamera:
             try:
                 from moge.model import import_model_class_by_version
             except ImportError:
-                # Fallback for local clone layout: project_root/MoGe
-                local_moge_repo = Path(__file__).resolve().parents[1] / "MoGe"
-                if local_moge_repo.exists() and str(local_moge_repo) not in sys.path:
-                    sys.path.insert(0, str(local_moge_repo))
+                local_moge = Path(__file__).resolve().parents[1] / "MoGe"
+                if local_moge.exists() and str(local_moge) not in sys.path:
+                    sys.path.insert(0, str(local_moge))
                 try:
                     from moge.model import import_model_class_by_version
                 except ImportError as exc:
                     raise ImportError(
-                        "MoGe is not available. Install it (or use local /MoGe clone), "
-                        "or provide a pre-loaded model via `model=`."
+                        "MoGe is not available. Install it or provide a pre-loaded model."
                     ) from exc
 
-            default_pretrained = {
+            defaults = {
                 "v1": "Ruicheng/moge-vitl",
                 "v2": "Ruicheng/moge-2-vitl-normal",
             }
             if pretrained_model_name_or_path is None:
-                if model_version not in default_pretrained:
+                if model_version not in defaults:
                     raise ValueError(
                         f"Unsupported model version '{model_version}'. "
-                        "Expected one of ['v1', 'v2']."
+                        "Expected 'v1' or 'v2'."
                     )
-                pretrained_model_name_or_path = default_pretrained[model_version]
+                pretrained_model_name_or_path = defaults[model_version]
 
             model = (
                 import_model_class_by_version(model_version)
@@ -567,10 +830,9 @@ class VirtualCamera:
             if use_fp16 and hasattr(model, "half"):
                 model.half()
 
-        image_tensor = torch.tensor(
-            image_normalized, dtype=torch.float32, device=device
-        ).permute(2, 0, 1)
-
+        image_tensor = torch.tensor(img, dtype=torch.float32, device=device).permute(
+            2, 0, 1
+        )
         output = model.infer(
             image_tensor,
             fov_x=fov_x,
@@ -580,7 +842,7 @@ class VirtualCamera:
         )
 
         if "depth" not in output:
-            raise KeyError('MoGe inference output is missing key "depth"')
+            raise KeyError('MoGe output is missing key "depth"')
 
         depth = output["depth"]
         if isinstance(depth, torch.Tensor):
@@ -590,179 +852,88 @@ class VirtualCamera:
 
         if depth.ndim == 3 and depth.shape[0] == 1:
             depth = depth[0]
-
         if depth.ndim != 2:
+            raise ValueError(f"Depth must be (H, W) or (1, H, W); got {depth.shape}")
+        if depth.shape != image_rgb.shape[:2]:
             raise ValueError(
-                f"Depth map must have shape (H, W) or (1, H, W); got {depth.shape}"
-            )
-
-        expected_shape = image_rgb.shape[:2]
-        if depth.shape != expected_shape:
-            raise ValueError(
-                f"Depth map shape {depth.shape} does not match image shape {expected_shape}"
+                f"Depth shape {depth.shape} != image shape {image_rgb.shape[:2]}"
             )
 
         return depth.astype(np.float32, copy=False)
 
-    def apply_velocity(
-        self, velocity: np.ndarray, dt: float = 1.0, frame: str = "world"
-    ):
-        """
-        Update camera pose by applying a 6D velocity vector.
-
-        Args:
-            velocity: 6D velocity [vx, vy, vz, wx, wy, wz]
-                        First 3 components are linear velocity (m/s)
-                        Last 3 components are angular velocity (rad/s)
-            dt: Time step for integration (seconds)
-            frame: Reference frame for velocity ('world' or 'camera')
-
-        Example:
-            # Move forward 0.1m and rotate 0.05 rad around z
-            camera.apply_velocity(np.array([0, 0, 0.1, 0, 0, 0.05]), dt=1.0, frame='camera')
-        """
-        v_lin = velocity[:3]  # Linear velocity
-        v_ang = velocity[3:]  # Angular velocity
-
-        # Update orientation (angular velocity)
-        rot_delta = R.from_rotvec(v_ang * dt)
-        if frame == "camera":
-            # Transform linear velocity from camera to world frame
-            v_lin_world = self._rotation.apply(v_lin)
-            self._position += v_lin_world * dt
-
-            # Update orientation (angular velocity in camera frame)
-            self._rotation = self._rotation * rot_delta
-        else:
-            self._position += v_lin * dt
-
-            # Update orientation (angular velocity in world frame)
-            self._rotation = rot_delta * self._rotation
-
-        self._update_extrinsics()
-
+    # ------------------------------------------------------------------
+    # String representations
+    # ------------------------------------------------------------------
     def __repr__(self) -> str:
-        """String representation of camera state."""
         pos = self._position
-        orient_deg = np.rad2deg(self._orientation)
+        deg = np.rad2deg(self._orientation)
+        K = self.get_K()
         return (
             f"VirtualCamera(\n"
-            f"  Position: [{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}] m\n"
-            f"  Orientation: [pitch={orient_deg[0]:.1f}°, "
-            f"roll={orient_deg[1]:.1f}°, yaw={orient_deg[2]:.1f}°]\n"
-            f"  Resolution: {self.intrinsics.width}x{self.intrinsics.height}\n"
-            f"  Focal: fx={self.intrinsics.fx:.1f}, fy={self.intrinsics.fy:.1f}\n"
+            f"  Position:    [{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}] m\n"
+            f"  Orientation: [pitch={deg[0]:.1f}°, roll={deg[1]:.1f}°, yaw={deg[2]:.1f}°]\n"
+            f"  Resolution:  {self.intrinsics.width}x{self.intrinsics.height}\n"
+            f"  K: [[{K[0, 0]:.1f}, 0, {K[0, 2]:.1f}],\n"
+            f"      [0, {K[1, 1]:.1f}, {K[1, 2]:.1f}],\n"
+            f"      [0, 0, 1]]\n"
             f")"
         )
 
     def __str__(self) -> str:
-        """Short string representation."""
         pos = self._position
-        orient_deg = np.rad2deg(self._orientation)
+        deg = np.rad2deg(self._orientation)
         return (
             f"VirtualCamera at [{pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f}] m, "
-            f"orientation [pitch={orient_deg[0]:.1f}°, roll={orient_deg[1]:.1f}°, "
-            f"yaw={orient_deg[2]:.1f}°]"
+            f"orientation [pitch={deg[0]:.1f}°, roll={deg[1]:.1f}°, yaw={deg[2]:.1f}°]"
         )
 
 
-# Example usage and utility functions
+# ---------------------------------------------------------------------------
+# Module-level factory functions (K-first API)
+# ---------------------------------------------------------------------------
+
+
 def create_camera_from_K(
     K: np.ndarray,
     width: int,
     height: int,
 ) -> VirtualCamera:
     """
-    Create a VirtualCamera directly from a 3x3 intrinsic matrix K.
+    Create a VirtualCamera from a 3x3 intrinsic matrix K.  **Preferred factory.**
 
     Args:
-        K: 3x3 intrinsic matrix.
-        width: Image width in pixels.
+        K:      3x3 intrinsic matrix.
+        width:  Image width in pixels.
         height: Image height in pixels.
 
     Returns:
-        VirtualCamera instance using intrinsics from K.
+        VirtualCamera instance.
     """
-    intrinsics = CameraIntrinsics.from_K(width=width, height=height, K=K)
-    return VirtualCamera(intrinsics)
+    return VirtualCamera.from_K(K=K, width=width, height=height)
 
 
 def create_default_camera(
-    width: int = 640,
-    height: int = 480,
+    width: int = 1920,
+    height: int = 1080,
     fov_deg: float = 60.0,
     intrinsic_matrix: Optional[np.ndarray] = None,
-    colmap_model_path: str = "data/sparse/0",
-    prefer_sfm_intrinsics: bool = True,
 ) -> VirtualCamera:
     """
-    Create a virtual camera with default parameters.
+    Create a VirtualCamera with sensible defaults.
+
+    When `intrinsic_matrix` is supplied it is used directly as K.
+    Otherwise K is derived from `fov_deg` (vertical FOV).
 
     Args:
-        width: Image width in pixels
-        height: Image height in pixels
-        fov_deg: Vertical field of view in degrees
-        intrinsic_matrix: Optional 3x3 intrinsic matrix K. If provided, it overrides
-            fx/fy/cx/cy while keeping width/height from function arguments.
-        colmap_model_path: Path to COLMAP sparse model folder used to load intrinsics.
-        prefer_sfm_intrinsics: If True and intrinsic_matrix is not provided, try loading
-            K from COLMAP first; fall back to FOV-based defaults on failure.
+        width:             Image width in pixels.
+        height:            Image height in pixels.
+        fov_deg:           Vertical field-of-view in degrees (used only when
+                           `intrinsic_matrix` is None).
+        intrinsic_matrix:  Optional 3x3 K matrix; takes precedence over `fov_deg`.
 
     Returns:
-        VirtualCamera instance
+        VirtualCamera instance.
     """
-    # Compute focal length from FOV
-    fov_rad = np.deg2rad(fov_deg)
-    fy = height / (2 * np.tan(fov_rad / 2))
-    fx = fy  # Square pixels
-
-    # Principal point at image center
-    cx = width / 2
-    cy = height / 2
-
-    intrinsics = CameraIntrinsics(
-        width=width, height=height, fx=fx, fy=fy, cx=cx, cy=cy
-    )
-    K_to_use = intrinsic_matrix
-    fallback_reason: Optional[str] = None
-    if K_to_use is None and prefer_sfm_intrinsics:
-        try:
-            from src.utils_colmap import get_camera_intrinsics_and_resolution
-
-            if Path(colmap_model_path).exists():
-                sfm_K, sfm_width, sfm_height = get_camera_intrinsics_and_resolution(
-                    colmap_model_path
-                )
-            else:
-                sfm_K = None
-                fallback_reason = f"COLMAP model path not found: {colmap_model_path}"
-
-            if sfm_K is not None:
-                # Scale SfM intrinsics to requested output resolution.
-                scale_x = float(width) / float(sfm_width)
-                scale_y = float(height) / float(sfm_height)
-                K_to_use = np.asarray(sfm_K, dtype=np.float64).copy()
-                K_to_use[0, 0] *= scale_x
-                K_to_use[1, 1] *= scale_y
-                K_to_use[0, 2] *= scale_x
-                K_to_use[1, 2] *= scale_y
-        except Exception:
-            # Fallback to default intrinsics computed from width/height/FOV.
-            K_to_use = None
-            fallback_reason = (
-                f"failed to load intrinsics from COLMAP model: {colmap_model_path}"
-            )
-
-    if K_to_use is not None:
-        intrinsics.set_intrinsics_from_K(K_to_use)
-    elif intrinsic_matrix is None and prefer_sfm_intrinsics:
-        print(
-            "[create_default_camera] Falling back to default intrinsics "
-            f"(fx={intrinsics.fx:.4f}, fy={intrinsics.fy:.4f}, "
-            f"cx={intrinsics.cx:.4f}, cy={intrinsics.cy:.4f})"
-        )
-        if fallback_reason is not None:
-            print(f"[create_default_camera] Reason: {fallback_reason}")
-        print(f"[create_default_camera] Fallback K:\n{intrinsics.to_matrix()}")
-
-    return VirtualCamera(intrinsics)
+    if intrinsic_matrix is not None:
+        return VirtualCamera.from_K(K=intrinsic_matrix, width=width, height=height)
+    return VirtualCamera.from_fov(width=width, height=height, fov_deg=fov_deg)

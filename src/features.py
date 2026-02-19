@@ -1,242 +1,228 @@
+from __future__ import annotations
+
+import contextlib
+import io
+import logging
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+
 import cv2
 import numpy as np
+from numpy.typing import NDArray
+
+logger = logging.getLogger(__name__)
 
 
-class Features:
-    def __init__(self, reference, query) -> None:
-        self.reference = reference
-        self.query = query
+# ---------------------------------------------------------------------------
+# Type aliases
+# ---------------------------------------------------------------------------
+ImageArray = NDArray[np.uint8]
+KeyPoints = NDArray[np.object_]
+Matches = NDArray[np.object_]
 
-    def match_sift(self):
-        sift = cv2.SIFT_create()
-        kp1, des1 = sift.detectAndCompute(self.reference, None)
-        kp2, des2 = sift.detectAndCompute(self.query, None)
-        flann = cv2.FlannBasedMatcher(dict(algorithm=1, trees=5), dict(checks=50))
-        matches = flann.knnMatch(des1, des2, k=2)
-        if len(matches) < 2:
-            return kp1, kp2, []
-        return kp1, kp2, [m for m, n in matches if m.distance < 0.7 * n.distance]
 
-    def match_xfeat(self):
-        import sys
-        from pathlib import Path
-        import torch
+# ---------------------------------------------------------------------------
+# Structured return type
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class MatchResult:
+    keypoints_ref: KeyPoints
+    keypoints_qry: KeyPoints
+    matches: Matches
 
-        # Add accelerated_features to sys.path if not present
-        acc_feat_path = str(Path(__file__).resolve().parents[1] / "accelerated_features")
-        if acc_feat_path not in sys.path:
-            sys.path.insert(0, acc_feat_path)
 
-        from accelerated_features.modules.xfeat import XFeat
-
-        xfeat = XFeat()
-
-        # detectAndCompute expects (B, C, H, W) or numpy (H, W, C) or (H, W)
-        # self.reference and self.query are likely grayscale (H, W)
-        out1 = xfeat.detectAndCompute(self.reference, top_k=4096)[0]
-        out2 = xfeat.detectAndCompute(self.query, top_k=4096)[0]
-
-        idxs0, idxs1 = xfeat.match(out1["descriptors"], out2["descriptors"])
-
-        # Convert to cv2.KeyPoint
-        kp1 = [
-            cv2.KeyPoint(float(p[0]), float(p[1]), 5.0) for p in out1["keypoints"]
-        ]
-        kp2 = [
-            cv2.KeyPoint(float(p[0]), float(p[1]), 5.0) for p in out2["keypoints"]
-        ]
-
-        # Convert to cv2.DMatch
-        matches = []
-        for i, j in zip(idxs0, idxs1):
-            matches.append(cv2.DMatch(int(i), int(j), 0.0))
-
-        return kp1, kp2, matches
-
-    def ransac_filter(self, kp1, kp2, matches):
-        if len(matches) < 4:
-            return [0] * len(matches)
-        src_pts = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 2)
-        dst_pts = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1, 2)
-
-        if len(np.unique(src_pts, axis=0)) < 4 or len(np.unique(dst_pts, axis=0)) < 4:
-            if np.allclose(src_pts, dst_pts, atol=1e-3):
-                return [1] * len(matches)
-            return [0] * len(matches)
-
-        M, mask = cv2.findHomography(
-            src_pts.reshape(-1, 1, 2), dst_pts.reshape(-1, 1, 2), cv2.RANSAC, 5.0
+# ---------------------------------------------------------------------------
+# Image helpers
+# ---------------------------------------------------------------------------
+def _validate_grayscale_image(image: np.ndarray, name: str = "image") -> None:
+    if image.ndim != 2:
+        raise ValueError(f"{name} must be a 2-D grayscale array, got shape {image.shape}.")
+    if image.size == 0:
+        raise ValueError(f"{name} must not be empty.")
+    if image.dtype not in (np.uint8, np.float32, np.float64):
+        raise ValueError(
+            f"{name} has unsupported dtype {image.dtype}. "
+            "Expected uint8, float32, or float64."
         )
 
-        if M is None or mask is None:
-            if np.allclose(src_pts, dst_pts, atol=1e-3):
-                return [1] * len(matches)
-            return [0] * len(matches)
 
-        inliers = mask.ravel().astype(int).tolist()
-        if not any(inliers) and np.allclose(src_pts, dst_pts, atol=1e-3):
-            return [1] * len(matches)
-        return inliers
+def _to_uint8(image: np.ndarray) -> ImageArray:
+    if image.dtype == np.uint8:
+        return image
+    return cv2.normalize(image, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
 
-    def refine_subpixel(self, image, points):
-        """
-        Refine the position of points in the image to sub-pixel accuracy.
-        Used for corner-like features.
-        """
-        if len(points) == 0:
-            return points
 
-        # Define criteria for the refinement (type, max_iter, epsilon)
-        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 40, 0.001)
-        # Search window size
-        winSize = (11, 11)
-        zeroZone = (-1, -1)
+def _resize_to_match(source: np.ndarray, target_shape: tuple[int, int]) -> np.ndarray:
+    return cv2.resize(source, (target_shape[1], target_shape[0]), interpolation=cv2.INTER_LINEAR)
 
-        # points must be float32 and shape (N, 1, 2)
-        pts = np.asarray(points, dtype=np.float32).reshape(-1, 1, 2)
-        
-        # Ensure image is uint8 grayscale
-        if image.dtype != np.uint8:
-            image_u8 = cv2.normalize(image, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-        else:
-            image_u8 = image
 
-        refined_pts = cv2.cornerSubPix(image_u8, pts, winSize, zeroZone, criteria)
-        return refined_pts.reshape(-1, 2)
+# ---------------------------------------------------------------------------
+# Matcher interface
+# ---------------------------------------------------------------------------
+class FeatureMatcher(ABC):
+    @abstractmethod
+    def match(self, reference: np.ndarray, query: np.ndarray) -> MatchResult:
+        ...
 
-    def refine_correspondence_lk(self, pts1, pts2_guess):
-        """
-        Refine the correspondence of pts1 in the query image using Lucas-Kanade,
-        starting from pts2_guess.
-        """
-        pts1 = np.asarray(pts1, dtype=np.float32).reshape(-1, 1, 2)
-        pts2 = np.asarray(pts2_guess, dtype=np.float32).reshape(-1, 1, 2)
 
-        pts2_refined, status, _ = cv2.calcOpticalFlowPyrLK(
-            self.reference, self.query, pts1, pts2,
-            winSize=(21, 21), maxLevel=3,
-            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 40, 0.001),
-            flags=cv2.OPTFLOW_USE_INITIAL_FLOW
-        )
-        return pts2_refined.reshape(-1, 2), status.ravel()
+# ---------------------------------------------------------------------------
+# SIFT matcher
+# ---------------------------------------------------------------------------
+class SIFTMatcher(FeatureMatcher):
+    def __init__(
+        self,
+        ratio_threshold: float = 0.7,
+        flann_trees: int = 5,
+        flann_checks: int = 50,
+    ) -> None:
+        if not (0.0 < ratio_threshold < 1.0):
+            raise ValueError(f"ratio_threshold must be in (0, 1), got {ratio_threshold}.")
 
-    def extract_quad_features(self, kp1, kp2, inlier_matches):
-        """
-        Select 4 corner correspondences from the max-area quad and return ready arrays.
-
-        Returns:
-            rendered_features: shape (4, 2), float32
-            real_features: shape (4, 2), float32
-            quad_matches: list of 4 cv2.DMatch
-        """
-        if len(inlier_matches) == 0:
-            raise ValueError("No inlier matches available to extract quad features.")
-
-        pts_ref = [kp1[m.queryIdx].pt for m in inlier_matches]
-        quad_ref = Features.max_area_quad(pts_ref)
-        if quad_ref is None:
-            raise ValueError("Could not compute max-area quad from inlier matches.")
-
-        quad_pts = np.asarray(quad_ref, dtype=np.float32).reshape(-1, 2)
-        ref_pts = np.asarray(
-            [kp1[m.queryIdx].pt for m in inlier_matches], dtype=np.float32
+        self._ratio_threshold = ratio_threshold
+        self._sift = cv2.SIFT_create()
+        self._flann = cv2.FlannBasedMatcher(
+            {"algorithm": 1, "trees": flann_trees},
+            {"checks": flann_checks},
         )
 
-        selected = []
-        used_indices = set()
-        for q in quad_pts:
-            sq_dist = np.sum((ref_pts - q[None, :]) ** 2, axis=1)
-            for idx in np.argsort(sq_dist):
-                idx_int = int(idx)
-                if idx_int not in used_indices:
-                    used_indices.add(idx_int)
-                    selected.append(inlier_matches[idx_int])
-                    break
+    def match(self, reference: np.ndarray, query: np.ndarray) -> MatchResult:
+        ref_u8 = _to_uint8(reference)
+        qry_u8 = _to_uint8(query)
 
-        if len(selected) != 4:
-            raise ValueError(
-                "Could not select exactly 4 matches from max-area quad corners."
+        kp1, des1 = self._sift.detectAndCompute(ref_u8, None)
+        kp2, des2 = self._sift.detectAndCompute(qry_u8, None)
+
+        if des1 is None or des2 is None or len(kp1) < 2 or len(kp2) < 2:
+            logger.warning(
+                "SIFT: insufficient features detected (ref=%d, qry=%d).",
+                len(kp1),
+                len(kp2),
+            )
+            return MatchResult(
+                np.array(kp1, dtype=object),
+                np.array(kp2, dtype=object),
+                np.empty((0,), dtype=object),
             )
 
-        rendered_features = np.asarray(
-            [kp1[m.queryIdx].pt for m in selected], dtype=np.float32
-        )
-        real_features_guess = np.asarray(
-            [kp2[m.trainIdx].pt for m in selected], dtype=np.float32
-        )
+        raw_matches = self._flann.knnMatch(des1, des2, k=2)
+        good = [
+            m
+            for pair in raw_matches
+            if len(pair) == 2
+            for m, n in [pair]
+            if m.distance < self._ratio_threshold * n.distance
+        ]
 
-        # 1. Refine rendered features to nearby corners in reference image
-        rendered_features_refined = self.refine_subpixel(self.reference, rendered_features)
-
-        # 2. Track refined rendered features into the query image using LK
-        # This provides high-precision sub-pixel correspondence.
-        real_features_refined, status = self.refine_correspondence_lk(
-            rendered_features_refined, real_features_guess
-        )
-
-        # If LK tracking fails for any point, fall back to cornerSubPix on query image
-        for i in range(len(status)):
-            if status[i] == 0:
-                print(f"[Features] LK refinement failed for point {i}, falling back to cornerSubPix.")
-                refined_q = self.refine_subpixel(self.query, real_features_guess[i:i+1])
-                real_features_refined[i] = refined_q[0]
-
-        return rendered_features_refined, real_features_refined, selected
-
-    @staticmethod
-    def triangle_area(a, b, c):
-        return (
-            abs(a[0] * (b[1] - c[1]) + b[0] * (c[1] - a[1]) + c[0] * (a[1] - b[1])) / 2
+        return MatchResult(
+            np.array(kp1, dtype=object),
+            np.array(kp2, dtype=object),
+            np.array(good, dtype=object),
         )
 
-    @staticmethod
-    def max_area_quad(points):
-        hull = cv2.convexHull(np.array(points, dtype=np.float32)).squeeze()
-        h = len(hull)
 
-        if h < 4:
-            return None
+# ---------------------------------------------------------------------------
+# XFeat matcher
+# ---------------------------------------------------------------------------
+class XFeatMatcher(FeatureMatcher):
+    def __init__(self, top_k: int = 4096, xfeat_root: str | None = None) -> None:
+        if top_k < 1:
+            raise ValueError(f"top_k must be a positive integer, got {top_k}.")
+        self._top_k = top_k
+        self._xfeat_root = xfeat_root
+        self._xfeat: object | None = None
 
-        max_area = 0
-        best_quad = None
+    def _get_xfeat(self) -> object:
+        if self._xfeat is not None:
+            return self._xfeat
 
-        for i in range(h):
-            for j in range(i + 2, h):
-                if (j + 1) % h == i:
-                    continue  # adjacent edges, skip
+        import sys
+        from pathlib import Path
 
-                # Find k maximizing area(i, k, j)
-                k = (i + 1) % h
-                best_k = k
-                while True:
-                    next_k = (k + 1) % h
-                    if Features.triangle_area(
-                        hull[i], hull[next_k], hull[j]
-                    ) > Features.triangle_area(hull[i], hull[k], hull[j]):
-                        k = next_k
-                        best_k = k
-                    else:
-                        break
+        if self._xfeat_root is not None:
+            if self._xfeat_root not in sys.path:
+                sys.path.insert(0, self._xfeat_root)
+        else:
+            default_root = str(Path(__file__).resolve().parents[1] / "accelerated_features")
+            if Path(default_root).exists() and default_root not in sys.path:
+                sys.path.insert(0, default_root)
 
-                # Find l maximizing area(i, j, l)
-                l = (j + 1) % h
-                best_l = l
-                while True:
-                    next_l = (l + 1) % h
-                    if Features.triangle_area(
-                        hull[i], hull[j], hull[next_l]
-                    ) > Features.triangle_area(hull[i], hull[j], hull[l]):
-                        l = next_l
-                        best_l = l
-                    else:
-                        break
+        from accelerated_features.modules.xfeat import XFeat  # type: ignore
 
-                curr_area = Features.triangle_area(
-                    hull[i], hull[best_k], hull[j]
-                ) + Features.triangle_area(hull[i], hull[j], hull[best_l])
+        # Silence third-party constructor prints (e.g. weight-path banner).
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
+            io.StringIO()
+        ):
+            self._xfeat = XFeat()
+        return self._xfeat
 
-                if curr_area > max_area:
-                    max_area = curr_area
-                    best_quad = (hull[i], hull[best_k], hull[j], hull[best_l])
+    def match(self, reference: np.ndarray, query: np.ndarray) -> MatchResult:
+        xfeat = self._get_xfeat()
 
-        return best_quad
+        ref_u8 = _to_uint8(reference)
+        qry_u8 = _to_uint8(query)
+        ref_bgr = cv2.cvtColor(ref_u8, cv2.COLOR_GRAY2BGR)
+        qry_bgr = cv2.cvtColor(qry_u8, cv2.COLOR_GRAY2BGR)
+
+        mkpts_0, mkpts_1 = xfeat.match_xfeat(ref_bgr, qry_bgr, top_k=self._top_k)
+        mkpts_0 = np.asarray(mkpts_0, dtype=np.float32).reshape(-1, 2)
+        mkpts_1 = np.asarray(mkpts_1, dtype=np.float32).reshape(-1, 2)
+
+        n = min(len(mkpts_0), len(mkpts_1))
+        mkpts_0 = mkpts_0[:n]
+        mkpts_1 = mkpts_1[:n]
+
+        kp1 = np.array([cv2.KeyPoint(float(p[0]), float(p[1]), 5.0) for p in mkpts_0], dtype=object)
+        kp2 = np.array([cv2.KeyPoint(float(p[0]), float(p[1]), 5.0) for p in mkpts_1], dtype=object)
+
+        if n < 4:
+            matches = np.array([cv2.DMatch(i, i, 0.0) for i in range(n)], dtype=object)
+            return MatchResult(kp1, kp2, matches)
+
+        H, mask = cv2.findHomography(
+            mkpts_0,
+            mkpts_1,
+            cv2.USAC_MAGSAC,
+            3.5,
+            maxIters=1_000,
+            confidence=0.999,
+        )
+
+        if H is None or mask is None:
+            matches = np.array([cv2.DMatch(i, i, 0.0) for i in range(n)], dtype=object)
+            return MatchResult(kp1, kp2, matches)
+
+        inlier_mask = mask.ravel().astype(bool)
+        matches = np.array(
+            [cv2.DMatch(i, i, 0.0) for i in range(len(inlier_mask)) if inlier_mask[i]],
+            dtype=object,
+        )
+
+        return MatchResult(kp1, kp2, matches)
+
+
+# ---------------------------------------------------------------------------
+# Thin compatibility facade
+# ---------------------------------------------------------------------------
+class Features:
+    def __init__(self, reference: np.ndarray, query: np.ndarray) -> None:
+        _validate_grayscale_image(reference, "reference")
+        _validate_grayscale_image(query, "query")
+
+        self.reference = reference
+        self.query = (
+            _resize_to_match(query, reference.shape[:2])
+            if query.shape[:2] != reference.shape[:2]
+            else query
+        )
+
+    def match_sift(self, ratio_threshold: float = 0.7):
+        result = SIFTMatcher(ratio_threshold=ratio_threshold).match(
+            self.reference, self.query
+        )
+        return result.keypoints_ref, result.keypoints_qry, result.matches
+
+    def match_xfeat(self, top_k: int = 4096, xfeat_root: str | None = None):
+        result = XFeatMatcher(top_k=top_k, xfeat_root=xfeat_root).match(
+            self.reference, self.query
+        )
+        return result.keypoints_ref, result.keypoints_qry, result.matches

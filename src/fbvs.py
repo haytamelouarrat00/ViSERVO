@@ -8,16 +8,16 @@ import cv2
 import numpy as np
 import torch
 
-from src.camera import create_camera_from_K
+from src.camera import create_camera_from_K, VirtualCamera
 from src.control import (
     geometric_error,
     interaction_matrix,
     normalize_features,
     velocity,
 )
-from src.features import Features
+from src.features import XFeatMatcher
+from src.mesh_scene import MeshScene
 from src.render_pipeline import render_gaussian_view
-from src.utils_colmap import get_camera_intrinsics
 
 
 # -----------------------------------------------------------------------------
@@ -83,121 +83,17 @@ def _safe_imshow(window_name: str, img: np.ndarray, wait_ms: int) -> None:
 # -----------------------------------------------------------------------------
 # Debug visualization (single render + matches)
 # -----------------------------------------------------------------------------
-def debug_viz(
-    ply_path: str | Path,
-    real_image_path: str | Path,
-    camera_pose: Sequence[float],
-    *,
-    scene_pose: Sequence[float] = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
-    device: str = "cuda",
-    width: int = 1280,
-    height: int = 720,
-    fov_deg: float = 60.0,
-    near: float = 0.01,
-    far: float = 100.0,
-    include_world_frame: bool = True,
-    axis_length: float | None = None,
-    axis_samples: int = 64,
-    axis_scale: float = 0.01,
-    window_name: str = "FBVS Debug Matches",
-    wait_key_ms: int = 0,
-    camera=None,
-) -> np.ndarray:
-    """
-    Render a Gaussian-splat view, match features vs. a real image, and show matches.
-
-    Returns:
-        BGR match visualization image.
-    """
-    camera_pose_np = np.asarray(camera_pose, dtype=np.float32)
-    scene_pose_np = np.asarray(scene_pose, dtype=np.float32)
-
-    real_bgr = cv2.imread(str(real_image_path), cv2.IMREAD_COLOR)
-    if real_bgr is None:
-        raise FileNotFoundError(f"Could not read image: {real_image_path}")
-
-    result = render_gaussian_view(
-        ply_path=ply_path,
-        camera_pose=camera_pose_np,
-        scene_pose=scene_pose_np,
-        device=device,
-        width=width,
-        height=height,
-        fov_deg=fov_deg,
-        near=near,
-        far=far,
-        include_world_frame=include_world_frame,
-        axis_length=axis_length,
-        axis_samples=axis_samples,
-        axis_scale=axis_scale,
-        return_alpha=False,
-        camera=camera,
-    )
-
-    render_rgb_u8 = (np.clip(result.rgb, 0.0, 1.0) * 255).astype(np.uint8)
-    render_bgr = cv2.cvtColor(render_rgb_u8, cv2.COLOR_RGB2BGR)
-
-    rendered_gray = cv2.cvtColor(render_bgr, cv2.COLOR_BGR2GRAY)
-    real_gray = cv2.cvtColor(real_bgr, cv2.COLOR_BGR2GRAY)
-
-    f = Features(rendered_gray, real_gray)
-    kp1, kp2, matches = f.match_xfeat()
-    mask = f.ransac_filter(kp1, kp2, matches)
-    inlier_matches = [m for m, keep in zip(matches, mask) if keep]
-    _, _, quad_matches = f.extract_quad_features(kp1, kp2, inlier_matches)
-
-    match_vis = cv2.drawMatches(
-        render_bgr,
-        kp1,
-        real_bgr,
-        kp2,
-        quad_matches,
-        None,
-        flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS,
-    )
-
-    # Display (optional blocking)
-    shown = False
-    try:
-        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-        cv2.imshow(window_name, match_vis)
-        shown = True
-
-        if wait_key_ms <= 0:
-            while True:
-                key = cv2.waitKey(30) & 0xFF
-                if key in (27, ord("q")):
-                    break
-                try:
-                    if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
-                        break
-                except cv2.error:
-                    break
-        else:
-            cv2.waitKey(wait_key_ms)
-    except cv2.error:
-        pass
-    finally:
-        if shown:
-            cv2.destroyWindow(window_name)
-            cv2.waitKey(1)
-
-    return match_vis
 
 
-# -----------------------------------------------------------------------------
-# FBVS (feature-based visual servoing)
-# -----------------------------------------------------------------------------
 def _init_scene_and_camera(
-    scene_path: str | Path, sparse_dir: str, device: torch.device
+    scene_path: str | Path, K:np.ndarray, device: torch.device
 ):
     """Load Gaussian scene and camera intrinsics."""
     from src.gs import GaussianSplattingScene
 
     scene_obj = GaussianSplattingScene(device=str(device))
     scene_obj.load_from_ply(str(scene_path))
-
-    K = get_camera_intrinsics(sparse_dir)
+    
     camera = create_camera_from_K(K, width=1920, height=1080)
 
     cam_h = int(camera.intrinsics.height)
@@ -206,7 +102,7 @@ def _init_scene_and_camera(
 
 
 def _load_and_fit_target(
-    desired_view_path: str | Path, cam_w: int, cam_h: int
+    desired_view_path: str | Path, cam_w: int, cam_h: int, verbose: bool = True
 ) -> tuple[np.ndarray, np.ndarray]:
     """Load desired view and resize to camera resolution; return (bgr, gray)."""
     real_bgr = cv2.imread(str(desired_view_path), cv2.IMREAD_COLOR)
@@ -214,10 +110,11 @@ def _load_and_fit_target(
         raise FileNotFoundError(f"Could not read image: {desired_view_path}")
 
     if real_bgr.shape[:2] != (cam_h, cam_w):
-        print(
-            f"[fbvs] resizing desired view from {real_bgr.shape[1]}x{real_bgr.shape[0]} "
-            f"to {cam_w}x{cam_h} to match camera intrinsics."
-        )
+        if verbose:
+            print(
+                f"[fbvs] resizing desired view from {real_bgr.shape[1]}x{real_bgr.shape[0]} "
+                f"to {cam_w}x{cam_h} to match camera intrinsics."
+            )
         real_bgr = cv2.resize(real_bgr, (cam_w, cam_h), interpolation=cv2.INTER_LINEAR)
 
     return real_bgr, cv2.cvtColor(real_bgr, cv2.COLOR_BGR2GRAY)
@@ -229,7 +126,7 @@ def _init_features_and_world_points(
     rendered_depth: np.ndarray,
     real_gray: np.ndarray,
     camera,
-    camera_pose_np: np.ndarray,
+    camera_pose: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Initialize tracked/desired features from first frame and back-project to world.
@@ -240,19 +137,22 @@ def _init_features_and_world_points(
         desired_features_norm (N,2)
         feature_points_world (N,3)
     """
-    f = Features(rendered_gray, real_gray)
-    kp1, kp2, matches = f.match_xfeat()
-    mask = f.ransac_filter(kp1, kp2, matches)
-    inlier_matches = [m for m, keep in zip(matches, mask) if keep]
+    xfeat_matcher = XFeatMatcher(top_k=4096)
+    match_result = xfeat_matcher.match(rendered_gray, real_gray)
+    kp1, kp2, matches = (
+        match_result.keypoints_ref,
+        match_result.keypoints_qry,
+        match_result.matches,
+    )
 
-    if not inlier_matches:
-        raise RuntimeError("[fbvs] No inlier matches found during initialization.")
+    if not matches:
+        raise RuntimeError("[fbvs] No feature matches found during initialization.")
 
     tracked_features_px = np.array(
-        [kp1[m.queryIdx].pt for m in inlier_matches], dtype=np.float32
+        [kp1[m.queryIdx].pt for m in matches], dtype=np.float32
     )
     desired_features_px = np.array(
-        [kp2[m.trainIdx].pt for m in inlier_matches], dtype=np.float32
+        [kp2[m.trainIdx].pt for m in matches], dtype=np.float32
     )
 
     desired_features_norm = normalize_features(desired_features_px, camera=camera)
@@ -265,7 +165,7 @@ def _init_features_and_world_points(
     init_depths = rendered_depth[uv[:, 1], uv[:, 0]]
     init_depths = np.clip(init_depths, 1e-6, None).astype(np.float32)
 
-    camera.set_pose(position=camera_pose_np[:3], orientation=camera_pose_np[3:])
+    camera.set_pose(position=camera_pose[:3], orientation=camera_pose[3:])
     feature_points_world = camera.back_project_to_world(
         tracked_features_px, init_depths
     ).astype(np.float32)
@@ -305,29 +205,21 @@ def fbvs(
     dt: float = 1.0,
     vis_window_name: str = "FBVS Current vs Target",
     vis_wait_ms: int = 1,
-    sparse_dir: str = "data/sparse/0",
+    K: np.ndarray = None,
     save_video: bool = True,
     video_path: str = "output.mp4",
     fps: float = 10.0,
     save_frames: bool = True,
     frames_dir: str | Path = "debug_frames",
-    accel_stop: float = 1e-6,
-    v_stop: float = 1e-9,
 ):
     """
-    Feature-Based Visual Servoing (FBVS) loop.
-
-    Key behavior preserved from your original code:
-    - Match features ONCE on first iteration.
-    - Use depth from first render to back-project to world points.
-    - Reproject same world points each iteration to get current 2D features.
-    - Build side-by-side visualization and (optionally) save to mp4 and per-frame PNGs.
+    Feature-Based Visual Servoing (FBVS) loop using Gaussian Splatting.
     """
-    camera_pose_np = np.asarray(initial_pose, dtype=np.float32).copy()
+    camera_pose = np.asarray(initial_pose, dtype=np.float32).copy()
     scene_pose_np = np.zeros(6, dtype=np.float32)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    scene_obj, camera, cam_w, cam_h = _init_scene_and_camera(scene, sparse_dir, device)
+    scene_obj, camera, cam_w, cam_h = _init_scene_and_camera(scene, K, device)
     real_bgr, real_gray = _load_and_fit_target(desired_view, cam_w, cam_h)
 
     video_writer = None
@@ -349,15 +241,13 @@ def fbvs(
     desired_features_norm = None
     feature_points_world = None
 
-    v_prev = np.zeros(6, dtype=np.float32)
-
     try:
         for i in range(max_iters):
             need_depth = feature_points_world is None
 
             result = render_gaussian_view(
                 scene=scene_obj,
-                camera_pose=camera_pose_np,
+                camera_pose=camera_pose,
                 scene_pose=scene_pose_np,
                 device=str(device),
                 camera=camera,
@@ -371,27 +261,22 @@ def fbvs(
             # --- one-time feature init ---
             if tracked_features_px is None:
                 if result.depth is None:
-                    print(
+                    raise RuntimeError(
                         "[fbvs] Failed to extract rendered depth map from Gaussian renderer."
                     )
-                    break
 
-                try:
-                    (
-                        tracked_features_px,
-                        desired_features_px,
-                        desired_features_norm,
-                        feature_points_world,
-                    ) = _init_features_and_world_points(
-                        rendered_gray=rendered_gray,
-                        rendered_depth=result.depth,
-                        real_gray=real_gray,
-                        camera=camera,
-                        camera_pose_np=camera_pose_np,
-                    )
-                except RuntimeError as e:
-                    print(str(e))
-                    break
+                (
+                    tracked_features_px,
+                    desired_features_px,
+                    desired_features_norm,
+                    feature_points_world,
+                ) = _init_features_and_world_points(
+                    rendered_gray=rendered_gray,
+                    rendered_depth=result.depth,
+                    real_gray=real_gray,
+                    camera=camera,
+                    camera_pose=camera_pose,
+                )
 
                 n_feat = len(desired_features_px)
                 print(f"[fbvs] Initialized with {n_feat} features.")
@@ -402,7 +287,7 @@ def fbvs(
                 print("[fbvs] 3D feature points were not initialized.")
                 break
 
-            camera.set_pose(position=camera_pose_np[:3], orientation=camera_pose_np[3:])
+            camera.set_pose(position=camera_pose[:3], orientation=camera_pose[3:])
             tracked_features_px = camera.project_points(feature_points_world).astype(
                 np.float32
             )
@@ -458,7 +343,7 @@ def fbvs(
                     current_size=render_bgr.shape[:2],
                     target_size=real_bgr.shape[:2],
                 )
-            
+
             print(f"iter={i:02d} error={e_norm:.6f}")
 
             if video_writer is not None:
@@ -478,29 +363,15 @@ def fbvs(
                 converged = True
                 break
 
-            # --- control law ---
+            # --- control law: error -> interaction matrix -> velocity -> pose update ---
             Lx = interaction_matrix(rendered_features, feature_depths_valid)
             v_cmd = velocity(Lx, error.reshape(-1), gain=gain).reshape(-1)
 
-            v_norm = float(np.linalg.norm(v_cmd))
-            accel = float(np.linalg.norm(v_cmd - v_prev))
-
-            if v_norm < v_stop:
-                print("[fbvs] Velocity reached zero. Stopping.")
-                break
-            if i > 0 and accel < accel_stop:
-                print(
-                    f"[fbvs] Acceleration below threshold ({accel:.2e} < {accel_stop:.2e}). Stopping."
-                )
-                break
-
-            v_prev = v_cmd.copy()
-
             # integrate pose update in camera frame
-            camera.set_pose(position=camera_pose_np[:3], orientation=camera_pose_np[3:])
+            camera.set_pose(position=camera_pose[:3], orientation=camera_pose[3:])
             camera.apply_velocity(v_cmd, dt=dt, frame="camera")
             position, orientation = camera.get_pose()
-            camera_pose_np = np.concatenate([position, orientation]).astype(np.float32)
+            camera_pose = np.concatenate([position, orientation]).astype(np.float32)
 
     finally:
         if video_writer is not None:
@@ -508,7 +379,9 @@ def fbvs(
             print(f"[fbvs] Simulation saved to {video_path}")
 
         if frame_output_dir is not None:
-            print(f"[fbvs] Saved {saved_frame_count} debug frames to {frame_output_dir}")
+            print(
+                f"[fbvs] Saved {saved_frame_count} debug frames to {frame_output_dir}"
+            )
 
         try:
             cv2.destroyWindow(vis_window_name)
@@ -517,9 +390,252 @@ def fbvs(
             pass
 
     print(f"[fbvs] converged={converged}")
-    print(f"[fbvs] final_pose={[round(x, 2) for x in camera_pose_np.flatten()]}")
+    print(f"[fbvs] final_pose={[round(x, 2) for x in camera_pose.flatten()]}")
 
     if last_rendered_features is None or last_real_features is None:
         raise RuntimeError("FBVS loop did not produce any feature correspondences.")
 
     return last_rendered_features, last_real_features
+
+
+def render_view(camera:VirtualCamera,
+                scene: MeshScene):
+    rgb = scene.render_from_virtual_camera(camera)
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    return rgb, gray
+
+def get_features_depth(features: np.ndarray, depth_map: np.ndarray):
+    coords = np.array(features).astype(int)
+    x, y = coords[:, 0], coords[:, 1]
+    h, w = depth_map.shape
+    x = np.clip(x, 0, w - 1)
+    y = np.clip(y, 0, h - 1)
+    return depth_map[y, x]
+
+def fbvs_mesh(
+    scene_ply: str | Path,
+    initial_pose: np.ndarray,
+    desired_view: str | Path,
+    *,
+    max_iters: int = 1000,
+    error_tolerance: float = 0.12,
+    gain: float = 0.5,
+    dt: float = 1.0,
+    vis_window_name: str = "FBVS Mesh Current vs Target",
+    vis_wait_ms: int = 1,
+    save_video: bool = True,
+    video_path: str = "output_mesh.mp4",
+    fps: float = 10.0,
+    save_frames: bool = True,
+    frames_dir: str | Path = "debug_frames_mesh",
+    verbose: bool = False,
+    desired_pose: np.ndarray = None,
+
+):
+    """
+    Feature-Based Visual Servoing (FBVS) loop using a Triangle Mesh scene.
+    """
+    from src.mesh_scene import MeshScene
+
+    camera_pose = np.asarray(initial_pose, dtype=np.float32).copy()
+
+    # Init mesh scene
+    scene_obj = MeshScene(verbose=verbose)
+    scene_obj.load_mesh(str(scene_ply))
+
+    # Init camera
+    K = np.array([
+        [1158.3, 0, 649],
+        [0, 1153.53, 483.5],
+        [0, 0, 1]
+    ])
+    camera = create_camera_from_K(K, width=1296, height=968)
+    cam_h = int(camera.intrinsics.height)
+    cam_w = int(camera.intrinsics.width)
+
+    real_bgr, real_gray = _load_and_fit_target(
+        desired_view, cam_w, cam_h, verbose=verbose
+    )
+
+    video_writer = None
+    enable_video = bool(verbose and save_video)
+    if enable_video:
+        video_writer, _ = _make_video_writer(video_path, cam_w, cam_h, fps=fps)
+
+    frame_output_dir = None
+    saved_frame_count = 0
+    enable_frames = bool(verbose and save_frames)
+    if enable_frames:
+        frame_output_dir = _make_frame_output_dir(frames_dir)
+        print(f"[fbvs_mesh] Saving debug frames to {frame_output_dir}")
+
+    last_rendered_features = None
+    last_real_features = None
+    converged = False
+
+    tracked_features_px = None
+    desired_features_px = None
+    desired_features_norm = None
+    feature_points_world = None
+
+    camera.set_pose(position=camera_pose[:3], orientation=camera_pose[3:])
+    render_rgb, render_gray = render_view(camera, scene_obj)
+    depth_device_name = "cuda" if torch.cuda.is_available() else "cpu"
+    render_depth = camera.render_depth_MoGe(
+        render_rgb,
+        device_name=depth_device_name,
+        resolution_level=6,
+    )
+
+    xf = XFeatMatcher(top_k=1024)
+    match_result = xf.match(render_gray, real_gray)
+    kp_ref, kp_qry, matches = (
+        match_result.keypoints_ref,
+        match_result.keypoints_qry,
+        match_result.matches,
+    )
+
+
+    current_features_px = np.array(
+        [kp_ref[m.queryIdx].pt for m in matches], dtype=np.float32
+    )
+    desired_features_px = np.array(
+        [kp_qry[m.trainIdx].pt for m in matches], dtype=np.float32
+    )
+    desired_features_norm = normalize_features(desired_features_px, camera=camera)
+
+    current_features_depths = get_features_depth(current_features_px, render_depth)
+    current_features_depths = np.clip(
+        np.asarray(current_features_depths, dtype=np.float32), 1e-6, None
+    )
+    feature_points_world = camera.back_project_to_world(
+        current_features_px, current_features_depths
+    ).astype(np.float32)
+
+    iteration = 0
+    norm = np.inf
+    while norm > error_tolerance and iteration < max_iters:
+        # Reproject fixed 3D feature points into the current view.
+        camera.set_pose(position=camera_pose[:3], orientation=camera_pose[3:])
+        render_rgb, render_gray = render_view(camera, scene_obj)
+        current_features_px = camera.project_points(feature_points_world).astype(np.float32)
+
+        points_h = np.hstack(
+            [
+                feature_points_world,
+                np.ones((feature_points_world.shape[0], 1), dtype=np.float32),
+            ]
+        )
+        points_cam = (camera.get_view_matrix() @ points_h.T).T[:, :3]
+        current_features_depths = points_cam[:, 2].astype(np.float32)
+
+        h_img, w_img = render_gray.shape[:2]
+        u = current_features_px[:, 0]
+        v = current_features_px[:, 1]
+        valid = (
+            (current_features_depths > 1e-6)
+            & (u >= 0.0)
+            & (u < float(w_img))
+            & (v >= 0.0)
+            & (v < float(h_img))
+        )
+
+        if np.sum(valid) < 3:
+            if verbose:
+                print(
+                    f"[fbvs_mesh] Too few features visible ({np.sum(valid)}). Stopping servoing loop."
+                )
+            break
+
+        need_panel = verbose
+        if need_panel:
+            if np.issubdtype(render_rgb.dtype, np.floating):
+                if float(np.max(render_rgb)) <= 1.0:
+                    render_rgb_u8 = np.clip(render_rgb * 255.0, 0.0, 255.0).astype(
+                        np.uint8
+                    )
+                else:
+                    render_rgb_u8 = np.clip(render_rgb, 0.0, 255.0).astype(np.uint8)
+            elif render_rgb.dtype == np.uint8:
+                render_rgb_u8 = render_rgb
+            else:
+                render_rgb_u8 = np.clip(render_rgb, 0, 255).astype(np.uint8)
+
+            render_bgr = cv2.cvtColor(render_rgb_u8, cv2.COLOR_RGB2BGR)
+            panel = _compose_current_target_view(render_bgr, real_bgr)
+            _draw_iteration_features(
+                panel=panel,
+                current_points_px=current_features_px,
+                target_points_px=desired_features_px,
+                current_size=render_bgr.shape[:2],
+                target_size=real_bgr.shape[:2],
+            )
+
+            if enable_video and video_writer is not None:
+                video_writer.write(panel)
+
+            if enable_frames and frame_output_dir is not None:
+                frame_path = frame_output_dir / f"frame_{iteration:04d}.png"
+                if cv2.imwrite(str(frame_path), panel):
+                    saved_frame_count += 1
+                else:
+                    print(f"[fbvs_mesh] Failed to write debug frame: {frame_path}")
+
+            if verbose:
+                _safe_imshow(vis_window_name, panel, vis_wait_ms)
+
+        current_features_norm = normalize_features(current_features_px[valid], camera=camera)
+        desired_features_norm_valid = desired_features_norm[valid]
+        current_features_depths_valid = current_features_depths[valid]
+
+        error, norm = geometric_error(desired_features_norm_valid, current_features_norm)
+        last_rendered_features = current_features_norm
+        last_real_features = desired_features_norm_valid
+
+        if norm <= error_tolerance:
+            converged = True
+            break
+
+        L = interaction_matrix(current_features_norm, current_features_depths_valid)
+        v_cmd = velocity(L, error.reshape(-1), gain)
+        camera.apply_velocity(v_cmd, dt=dt, frame="camera")
+        position, orientation = camera.get_pose()
+        camera_pose = np.concatenate([position, orientation]).astype(np.float32)
+
+        iteration += 1
+        if verbose:
+            print(
+                f"[fbvs_mesh] Iteration: {iteration}, error norm: {norm}, velocity norm: {np.linalg.norm(v_cmd)}"
+            )
+
+    if enable_video and video_writer is not None:
+        video_writer.release()
+        print(f"[fbvs_mesh] Simulation saved to {video_path}")
+
+    if enable_frames and frame_output_dir is not None:
+        print(f"[fbvs_mesh] Saved {saved_frame_count} debug frames to {frame_output_dir}")
+
+    if verbose:
+        try:
+            cv2.destroyWindow(vis_window_name)
+            cv2.waitKey(1)
+        except cv2.error:
+            pass
+
+    print(f"[fbvs_mesh] converged={converged}")
+    print(f"[fbvs_mesh] final_pose={[round(x, 2) for x in camera_pose.flatten()]}")
+    if desired_pose is not None:
+        diff = desired_pose - camera_pose
+        pos = diff[:3]
+        rot = diff[3:]
+        print(f"Final Difference: position => {pos}, rotation => {rot}")
+
+    if last_rendered_features is None or last_real_features is None:
+        raise RuntimeError("FBVS mesh loop did not produce any feature correspondences.")
+
+    return {
+        "converged": bool(converged),
+        "iterations": int(iteration),
+        "final_pose": camera_pose.copy(),
+        "final_error": float(norm),
+    }

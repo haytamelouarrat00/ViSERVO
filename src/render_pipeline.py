@@ -21,9 +21,9 @@ class RenderResult:
 
 def render_gaussian_view(
     ply_path: str | Path | None = None,
-    camera_pose: Sequence[float] = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+    camera_pose: np.ndarray = np.array([0, 0, 0, 0, 0, 0], dtype=np.float32),
     *,
-    scene_pose: Sequence[float] = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+    scene_pose: np.ndarray = np.array([0, 0, 0, 0, 0, 0], dtype=np.float32),
     device: str = "cuda",
     width: int = 1920,
     height: int = 1080,

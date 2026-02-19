@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Optional, Sequence
 
 import cv2
 import numpy as np
@@ -417,19 +417,22 @@ def fbvs_mesh(
     initial_pose: np.ndarray,
     desired_view: str | Path,
     *,
-    max_iters: int = 1000,
+    max_iters: int = 20,
     error_tolerance: float = 0.12,
     gain: float = 0.5,
     dt: float = 1.0,
     vis_window_name: str = "FBVS Mesh Current vs Target",
     vis_wait_ms: int = 1,
-    save_video: bool = True,
+    save_video: bool = False,
     video_path: str = "output_mesh.mp4",
     fps: float = 10.0,
-    save_frames: bool = True,
+    save_frames: bool = False,
     frames_dir: str | Path = "debug_frames_mesh",
     verbose: bool = False,
     desired_pose: np.ndarray = None,
+    depth_model: Optional[Any] = None,
+    depth_device_name: Optional[str] = None,
+    depth_resolution_level: int = 6,
 
 ):
     """
@@ -480,11 +483,13 @@ def fbvs_mesh(
 
     camera.set_pose(position=camera_pose[:3], orientation=camera_pose[3:])
     render_rgb, render_gray = render_view(camera, scene_obj)
-    depth_device_name = "cuda" if torch.cuda.is_available() else "cpu"
+    if depth_device_name is None:
+        depth_device_name = "cuda" if torch.cuda.is_available() else "cpu"
     render_depth = camera.render_depth_MoGe(
         render_rgb,
+        model=depth_model,
         device_name=depth_device_name,
-        resolution_level=6,
+        resolution_level=int(depth_resolution_level),
     )
 
     xf = XFeatMatcher(top_k=1024)
@@ -633,9 +638,11 @@ def fbvs_mesh(
     if last_rendered_features is None or last_real_features is None:
         raise RuntimeError("FBVS mesh loop did not produce any feature correspondences.")
 
-    return {
+    metrics = {
         "converged": bool(converged),
         "iterations": int(iteration),
         "final_pose": camera_pose.copy(),
         "final_error": float(norm),
     }
+    scene_obj.cleanup()
+    return metrics

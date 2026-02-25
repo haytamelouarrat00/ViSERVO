@@ -11,7 +11,7 @@ from typing import Any, Optional
 import numpy as np
 import torch
 
-from src.fbvs import fbvs_mesh
+from src.fbvs import fbvs_mesh, dvs_mesh
 from src.scene_ops import pose6_from_T
 
 
@@ -699,71 +699,120 @@ def geodesic_angle(r1, r2) -> float:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Show live current-vs-target view while FBVS mesh simulation runs.",
-    )
-    parser.add_argument(
-        "--dataset-dir",
-        type=Path,
-        default=Path("data/apt1/kitchen/data"),
-        help="Directory containing frame-XXXXXX.{color.jpg,depth.png,pose.txt}",
-    )
-    parser.add_argument(
-        "--scene-ply",
-        type=Path,
-        default=Path("data/apt1/kitchen/akitchen.ply"),
-        help="Path to mesh (.ply) used by fbvs_mesh.",
-    )
-    parser.add_argument(
-        "--runs-csv",
-        type=Path,
-        default=Path("logs/fbvs_mesh_runs_05.csv"),
-        help="CSV file where each fbvs_mesh run is appended.",
-    )
-    parser.add_argument(
-        "--tests",
-        type=int,
-        default=1,
-        help="Number of randomized FBVS evaluations to run.",
-    )
-    parser.add_argument(
-        "--pose-tweak",
-        type=float,
-        default=0.1,
-        help="Relative random perturbation magnitude for each pose element.",
-    )
-    parser.add_argument(
-        "--summary",
-        action="store_true",
-        help="Print robustness summary from the runs CSV after evaluation.",
-    )
-    parser.add_argument(
-        "--summary-only",
-        action="store_true",
-        help="Only print summary from --runs-csv and exit.",
-    )
-    args = parser.parse_args()
+    # parser = argparse.ArgumentParser()
+    # parser.add_argument(
+    #     "--verbose",
+    #     action="store_true",
+    #     help="Show live current-vs-target view while FBVS mesh simulation runs.",
+    # )
+    # parser.add_argument(
+    #     "--dataset-dir",
+    #     type=Path,
+    #     default=Path("data/apt1/living/data"),
+    #     help="Directory containing frame-XXXXXX.{color.jpg,depth.png,pose.txt}",
+    # )
+    # parser.add_argument(
+    #     "--scene-ply",
+    #     type=Path,
+    #     default=Path("data/apt1/living/aliving.ply"),
+    #     help="Path to mesh (.ply) used by fbvs_mesh.",
+    # )
+    # parser.add_argument(
+    #     "--runs-csv",
+    #     type=Path,
+    #     default=Path("logs/fbvs_mesh_runs_05.csv"),
+    #     help="CSV file where each fbvs_mesh run is appended.",
+    # )
+    # parser.add_argument(
+    #     "--tests",
+    #     type=int,
+    #     default=1,
+    #     help="Number of randomized FBVS evaluations to run.",
+    # )
+    # parser.add_argument(
+    #     "--pose-tweak",
+    #     type=float,
+    #     default=0.1,
+    #     help="Relative random perturbation magnitude for each pose element.",
+    # )
+    # parser.add_argument(
+    #     "--summary",
+    #     action="store_true",
+    #     help="Print robustness summary from the runs CSV after evaluation.",
+    # )
+    # parser.add_argument(
+    #     "--summary-only",
+    #     action="store_true",
+    #     help="Only print summary from --runs-csv and exit.",
+    # )
+    # args = parser.parse_args()
+    #
+    # if args.summary_only:
+    #     summarize_mesh_eval(args.runs_csv, print_summary=True)
+    #     raise SystemExit(0)
+    #
+    # if args.verbose:
+    #     print(f"[main] dataset dir: {args.dataset_dir}")
+    #     print("[main] desired frame idx is sampled randomly in [0, 1100] per trial.")
+    #
+    # # Example batch evaluation:
+    # # python main.py --tests 20 --pose-tweak 0.15 --runs-csv logs/fbvs_mesh_runs_05.csv
+    # mesh_eval(
+    #     scene_ply=args.scene_ply,
+    #     dataset_dir=args.dataset_dir,
+    #     tests=args.tests,
+    #     runs_csv=args.runs_csv,
+    #     verbose=args.verbose,
+    #     pose_tweak=args.pose_tweak,
+    # )
+    # if args.summary:
+    #     summarize_mesh_eval(args.runs_csv, print_summary=True)
 
-    if args.summary_only:
-        summarize_mesh_eval(args.runs_csv, print_summary=True)
-        raise SystemExit(0)
+    # Example single FBVS simulation (from a given initial pose to a target image) with verbose ON.
+    # Set this to True when you want to run exactly one simulation example.
+    """
+    python main.py --tests 50 --pose-tweak 0.10 --dataset-dir data/apt1/kitchen/data --runs-csv logs/fbvs_mesh_runs_10.csv
+    """
+    example_scene_ply = Path("data/apt1/living/aliving.ply")
+    example_dataset_dir = Path("data/apt1/living/data")
+    example_frame_idx = 13
 
-    if args.verbose:
-        print(f"[main] dataset dir: {args.dataset_dir}")
-        print("[main] desired frame idx is sampled randomly in [0, 1100] per trial.")
-
-    # Example batch evaluation:
-    # python main.py --tests 20 --pose-tweak 0.15 --runs-csv logs/fbvs_mesh_runs_05.csv
-    mesh_eval(
-        scene_ply=args.scene_ply,
-        dataset_dir=args.dataset_dir,
-        tests=args.tests,
-        runs_csv=args.runs_csv,
-        verbose=args.verbose,
-        pose_tweak=args.pose_tweak,
+    desired_rgb_path, _, desired_pose = get_frame_paths_and_pose(
+        example_dataset_dir, example_frame_idx
     )
-    if args.summary:
-        summarize_mesh_eval(args.runs_csv, print_summary=True)
+    initial_pose = np.array(
+        [0, 0.1, 1.3, -2.20, -0.2,
+         -0.7], dtype=np.float32
+    )
+    #
+    # run_metrics = fbvs_mesh(
+    #     scene_ply=example_scene_ply,
+    #     initial_pose=initial_pose,
+    #     desired_view=desired_rgb_path,
+    #     error_tolerance=0.025,
+    #     desired_pose=desired_pose,
+    #     verbose=True,
+    #     save_frames=True,
+    #     frames_dir="debug_frames/"
+    # )
+    # print(f"[single_fbvs_example] {run_metrics}")
+    # final_pose = np.asarray(run_metrics["final_pose"], dtype=np.float32).reshape(-1)
+    # desired_pose_arr = np.asarray(desired_pose, dtype=np.float32).reshape(-1)
+    # pos_distance_m = float(np.linalg.norm(desired_pose_arr[:3] - final_pose[:3]))
+    # geodesic_rot_rad = geodesic_angle(desired_pose_arr[3:6], final_pose[3:6])
+    # print(
+    #     f"[single_fbvs_example] position_distance_m={pos_distance_m:.6f}, "
+    #     f"geodesic_rotation_rad={geodesic_rot_rad:.6f}"
+    # )
+    dvs_mesh(
+        scene_ply=example_scene_ply,
+        initial_pose=desired_pose,
+        desired_view=desired_rgb_path,
+        error_tolerance=0.025,
+        desired_pose=desired_pose,
+        verbose=True,
+        save_frames=True,
+        frames_dir="debug_frames/"
+    )
+
+

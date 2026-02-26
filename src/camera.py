@@ -177,7 +177,7 @@ class CameraIntrinsics:
 
     def __post_init__(self):
         if self.K is None:
-            # Default: identity-like K with principal point at image centre and f=1
+            # Default: identity-like K with principal point at image center and f=1
             self.K = np.array(
                 [
                     [1.0, 0.0, self.width / 2.0],

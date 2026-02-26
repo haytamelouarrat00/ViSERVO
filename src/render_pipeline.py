@@ -6,7 +6,7 @@ from typing import Optional, Sequence
 
 import numpy as np
 
-from src.camera import create_default_camera
+from src.camera import create_camera_from_K
 from src.gs import GaussianParameters, GaussianSplattingScene
 from src.scene_ops import add_world_frame_gaussians, apply_scene_pose, scene_bounds
 
@@ -79,7 +79,7 @@ def render_gaussian_view(
         pass
 
     if camera is None:
-        camera = create_default_camera(width=width, height=height, fov_deg=fov_deg)
+        camera = create_camera_from_K(width=width, height=height, K=K)
 
     camera.set_pose(position=camera_pose_np[:3])
     camera.set_pose(orientation=camera_pose_np[3:])

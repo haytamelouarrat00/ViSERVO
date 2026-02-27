@@ -13,6 +13,8 @@ from src.servoing import (
     _safe_imshow,
     dvs_mesh,
     fbvs,
+    fbvs_gaussian_redetect,
+    fbvs_redetect,
     fbvs_mesh,
     get_features_depth,
     render_view,
@@ -21,6 +23,8 @@ from src.servoing.gaussian_fbvs import _init_features_and_world_points, _init_sc
 
 __all__ = [
     "fbvs",
+    "fbvs_redetect",
+    "fbvs_gaussian_redetect",
     "fbvs_mesh",
     "dvs_mesh",
     "render_view",

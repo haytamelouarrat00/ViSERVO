@@ -387,5 +387,205 @@ def fbvs(
     return metrics
 
 
+def fbvs_redetect(
+    scene: str | Path,
+    initial_pose: Sequence[float],
+    desired_view: str | Path,
+    *,
+    max_iters: int = 100,
+    error_tolerance: float = 0.025,
+    gain: float = 1,
+    dt: float = 1.0,
+    vis_window_name: str = "FBVS Current vs Target",
+    vis_wait_ms: int = 1,
+    K: np.ndarray = None,
+    save_video: bool = True,
+    video_path: str = "output_gs_fbvs.mp4",
+    fps: float = 30.0,
+    save_frames: bool = True,
+    frames_dir: str | Path = "debug_frames",
+    verbose: bool = False,
+    desired_pose: np.ndarray = None,
+):
+    """
+    Gaussian FBVS loop that re-detects and re-matches features every iteration.
+    """
+    camera_pose = np.asarray(initial_pose, dtype=np.float32).copy()
+    if camera_pose.size != 6:
+        raise ValueError(f"initial_pose must have 6 elements, got shape {camera_pose.shape}")
+    scene_pose_np = np.zeros(6, dtype=np.float32)
 
-__all__ = ["fbvs", "_init_scene_and_camera", "_init_features_and_world_points"]
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    scene_obj, camera, cam_w, cam_h = _init_scene_and_camera(scene, K, device)
+    real_bgr, real_gray = _load_and_fit_target(desired_view, cam_w, cam_h)
+
+    video_writer = None
+    enable_video = bool(verbose and save_video)
+    if enable_video:
+        video_writer, _ = _make_video_writer(video_path, cam_w, cam_h, fps=fps)
+
+    frame_output_dir = None
+    saved_frame_count = 0
+    enable_frames = bool(verbose and save_frames)
+    if enable_frames:
+        frame_output_dir = _make_frame_output_dir(frames_dir)
+        print(f"[fbvs_gaussian_redetect] Saving debug frames to {frame_output_dir}")
+
+    converged = False
+    iteration = 0
+    norm = np.inf
+    last_rendered_features = None
+    last_real_features = None
+    xf = XFeatMatcher(top_k=1024)
+
+    try:
+        while norm > error_tolerance and iteration < max_iters:
+            camera.set_pose(position=camera_pose[:3], orientation=camera_pose[3:])
+            result = render_gaussian_view(
+                scene=scene_obj,
+                camera_pose=camera_pose,
+                scene_pose=scene_pose_np,
+                device=str(device),
+                camera=camera,
+                return_depth=True,
+            )
+            render_rgb = np.asarray(result.rgb, dtype=np.float32)
+            render_depth = np.asarray(result.depth, dtype=np.float32)
+            render_gray = cv2.cvtColor(render_rgb, cv2.COLOR_RGB2GRAY)
+
+            match_result = xf.match(render_gray, real_gray)
+            kp_ref, kp_qry, matches = (
+                match_result.keypoints_ref,
+                match_result.keypoints_qry,
+                match_result.matches,
+            )
+
+            if len(matches) < 3:
+                if verbose:
+                    print(
+                        f"[fbvs_gaussian_redetect] Too few matched features ({len(matches)}). Stopping servoing loop."
+                    )
+                break
+
+            current_features_px = np.array(
+                [kp_ref[m.queryIdx].pt for m in matches], dtype=np.float32
+            ).reshape(-1, 2)
+            desired_features_px = np.array(
+                [kp_qry[m.trainIdx].pt for m in matches], dtype=np.float32
+            ).reshape(-1, 2)
+            current_features_depths = get_features_depth(current_features_px, render_depth)
+            current_features_depths = np.asarray(current_features_depths, dtype=np.float32)
+            valid = current_features_depths > 1e-6
+
+            if np.sum(valid) < 3:
+                if verbose:
+                    print(
+                        "[fbvs_gaussian_redetect] Too few valid feature depths. Stopping servoing loop."
+                    )
+                break
+
+            need_panel = verbose or enable_video or enable_frames
+            if need_panel:
+                render_rgb_u8 = render_rgb_to_u8(render_rgb)
+                render_bgr = cv2.cvtColor(render_rgb_u8, cv2.COLOR_RGB2BGR)
+                panel = _compose_current_target_view(render_bgr, real_bgr)
+                _draw_iteration_features(
+                    panel=panel,
+                    current_points_px=current_features_px,
+                    target_points_px=desired_features_px,
+                    current_size=render_bgr.shape[:2],
+                    target_size=real_bgr.shape[:2],
+                )
+
+                if enable_video and video_writer is not None:
+                    video_writer.write(panel)
+
+                if enable_frames and frame_output_dir is not None:
+                    frame_path = frame_output_dir / f"frame_{iteration:04d}.png"
+                    if cv2.imwrite(str(frame_path), panel):
+                        saved_frame_count += 1
+                    elif verbose:
+                        print(
+                            f"[fbvs_gaussian_redetect] Failed to write debug frame: {frame_path}"
+                        )
+
+                if verbose:
+                    _safe_imshow(vis_window_name, panel, vis_wait_ms)
+
+            current_features_norm = normalize_features(current_features_px[valid], camera=camera)
+            desired_features_norm = normalize_features(desired_features_px[valid], camera=camera)
+            current_features_depths_valid = current_features_depths[valid]
+
+            error, norm = geometric_error(desired_features_norm, current_features_norm)
+            last_rendered_features = current_features_norm
+            last_real_features = desired_features_norm
+
+            if norm <= error_tolerance:
+                converged = True
+                break
+
+            L = interaction_matrix(current_features_norm, current_features_depths_valid)
+            v_cmd = velocity(L, error.reshape(-1), gain)
+            camera.apply_velocity(v_cmd, dt=dt, frame="camera")
+            position, orientation = camera.get_pose()
+            camera_pose = np.concatenate([position, orientation]).astype(np.float32)
+
+            iteration += 1
+            if verbose:
+                print(
+                    "[fbvs_gaussian_redetect] Iteration: "
+                    f"{iteration}, error norm: {norm}, velocity norm: {np.linalg.norm(v_cmd)}"
+                )
+    finally:
+        if enable_video and video_writer is not None:
+            video_writer.release()
+            if verbose:
+                print(f"[fbvs_gaussian_redetect] Simulation saved to {video_path}")
+
+        if enable_frames and frame_output_dir is not None and verbose:
+            print(
+                "[fbvs_gaussian_redetect] Saved "
+                f"{saved_frame_count} debug frames to {frame_output_dir}"
+            )
+
+        if verbose:
+            try:
+                cv2.destroyWindow(vis_window_name)
+                cv2.waitKey(1)
+            except cv2.error:
+                pass
+
+        scene_obj.cleanup()
+
+    print(f"[fbvs_gaussian_redetect] converged={converged}")
+    print(f"[fbvs_gaussian_redetect] final_pose={[round(x, 3) for x in camera_pose.flatten()]}")
+    if desired_pose is not None:
+        desired_pose_arr = np.asarray(desired_pose, dtype=np.float32).reshape(-1)
+        if desired_pose_arr.size >= 6:
+            diff = desired_pose_arr[:6] - camera_pose[:6]
+            print(f"Final Difference: position => {diff[:3]}, rotation => {diff[3:]}")
+
+    if last_rendered_features is None or last_real_features is None:
+        raise RuntimeError(
+            "FBVS Gaussian redetect loop did not produce any feature correspondences."
+        )
+
+    metrics = {
+        "converged": bool(converged),
+        "iterations": int(iteration),
+        "final_pose": camera_pose.copy(),
+        "final_error": float(norm),
+    }
+    return metrics
+
+
+fbvs_gaussian_redetect = fbvs_redetect
+
+
+__all__ = [
+    "fbvs",
+    "fbvs_redetect",
+    "fbvs_gaussian_redetect",
+    "_init_scene_and_camera",
+    "_init_features_and_world_points",
+]

@@ -1,4 +1,4 @@
-from src.servoing.gaussian_fbvs import fbvs
+from src.servoing.gaussian_fbvs import fbvs, fbvs_gaussian_redetect, fbvs_redetect
 from src.servoing.mesh_common import get_features_depth, render_view
 from src.servoing.mesh_dvs import dvs_mesh
 from src.servoing.mesh_fbvs import fbvs_mesh
@@ -13,6 +13,8 @@ from src.servoing.visualization import (
 
 __all__ = [
     "fbvs",
+    "fbvs_redetect",
+    "fbvs_gaussian_redetect",
     "fbvs_mesh",
     "dvs_mesh",
     "render_view",

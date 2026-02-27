@@ -11,7 +11,7 @@ from typing import Any, Optional
 import numpy as np
 import torch
 
-from src.fbvs import fbvs_mesh, dvs_mesh
+from src.fbvs import fbvs as fbvs_gaussian, fbvs_mesh, dvs_mesh, fbvs_redetect
 from src.scene_ops import pose6_from_T
 
 
@@ -301,6 +301,164 @@ def mesh_eval(
                 final_error=float("nan"),
             )
             print(f"[WARN] Test {t + 1}/{tests} failed with exception: {exc}")
+        finally:
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+
+def _load_colmap_image_entries(images_txt_path: str | Path) -> list[dict[str, Any]]:
+    """
+    Parse COLMAP `images.txt` and return entries with image id, name, and c2w pose.
+    """
+    from scipy.spatial.transform import Rotation as R
+
+    images_txt = Path(images_txt_path)
+    if not images_txt.exists():
+        raise FileNotFoundError(f"COLMAP images.txt not found: {images_txt}")
+
+    entries: list[dict[str, Any]] = []
+    with images_txt.open("r", encoding="utf-8") as f:
+        while True:
+            header = f.readline()
+            if not header:
+                break
+            header = header.strip()
+            if not header or header.startswith("#"):
+                continue
+
+            parts = header.split()
+            if len(parts) < 10:
+                raise ValueError(f"Malformed COLMAP image header line: '{header}'")
+
+            image_id = int(parts[0])
+            qw, qx, qy, qz = map(float, parts[1:5])
+            tx, ty, tz = map(float, parts[5:8])
+            image_name = parts[9]
+
+            R_w2c = R.from_quat([qx, qy, qz, qw]).as_matrix()
+            t_w2c = np.array([tx, ty, tz], dtype=np.float64)
+
+            R_c2w = R_w2c.T
+            C_world = -R_c2w @ t_w2c
+            euler_c2w = R.from_matrix(R_c2w).as_euler("xyz")
+            pose_c2w = np.array(
+                [
+                    C_world[0],
+                    C_world[1],
+                    C_world[2],
+                    euler_c2w[0],
+                    euler_c2w[1],
+                    euler_c2w[2],
+                ],
+                dtype=np.float32,
+            )
+
+            entries.append(
+                {
+                    "image_id": image_id,
+                    "image_name": image_name,
+                    "pose_c2w": pose_c2w,
+                }
+            )
+
+            # Skip POINTS2D line (the second line for this image entry).
+            _ = f.readline()
+
+    return entries
+
+
+def gaussian_eval(
+    scene_ply: str | Path,
+    images_dir: str | Path,
+    colmap_images_txt: str | Path,
+    tests: int,
+    runs_csv: str | Path,
+    *,
+    verbose: bool = False,
+    pose_tweak: float = 0.1,
+    K: Optional[np.ndarray] = None,
+    error_tolerance: float = 0.035,
+    max_iters: int = 20,
+    use_redetect: bool = True,
+) -> None:
+    """
+    Run Gaussian FBVS multiple times with random desired images from COLMAP `images.txt`.
+    """
+    scene_ply = Path(scene_ply)
+    images_dir = Path(images_dir)
+    tests = int(tests)
+
+    entries = _load_colmap_image_entries(colmap_images_txt)
+    if not entries:
+        raise ValueError(f"No image entries parsed from {colmap_images_txt}")
+
+    if verbose:
+        print(
+            f"[gaussian_eval] Loaded {len(entries)} COLMAP entries from {colmap_images_txt}"
+        )
+        print(
+            f"[gaussian_eval] Controller={('fbvs_redetect' if use_redetect else 'fbvs')}, "
+            f"tests={tests}, pose_tweak={pose_tweak}"
+        )
+
+    controller = fbvs_redetect if use_redetect else fbvs_gaussian
+
+    for t in range(tests):
+        sampled = entries[int(np.random.randint(0, len(entries)))]
+        run_desired_rgb_path = images_dir / str(sampled["image_name"])
+        run_desired_pose = np.asarray(sampled["pose_c2w"], dtype=np.float32).reshape(-1)
+        random_pose = np.full(6, np.nan, dtype=np.float32)
+
+        try:
+            if not run_desired_rgb_path.exists():
+                raise FileNotFoundError(f"Missing desired image file: {run_desired_rgb_path}")
+
+            if verbose:
+                print(
+                    f"[gaussian_eval] Test {t + 1}/{tests}: "
+                    f"image_id={sampled['image_id']}, image={sampled['image_name']}"
+                )
+
+            random_pose = tweak_pose(run_desired_pose, tweak=pose_tweak)
+            run_metrics = controller(
+                scene=scene_ply,
+                initial_pose=random_pose,
+                desired_view=run_desired_rgb_path,
+                error_tolerance=error_tolerance,
+                desired_pose=run_desired_pose,
+                verbose=verbose,
+                K=K,
+                max_iters=max_iters,
+                save_frames=False,
+                save_video=False,
+            )
+            append_fbvs_run_to_csv(
+                runs_csv,
+                desired_image_path=run_desired_rgb_path,
+                desired_pose=run_desired_pose,
+                initial_pose=random_pose,
+                converged=run_metrics["converged"],
+                iterations_before_converging=run_metrics["iterations"],
+                final_pose=run_metrics["final_pose"],
+                final_error=run_metrics["final_error"],
+            )
+            print(
+                f"[INFO] Gaussian test {t + 1}/{tests} completed: "
+                f"{'Success' if run_metrics['converged'] else 'Failed'}"
+            )
+        except Exception as exc:
+            append_fbvs_run_to_csv(
+                runs_csv,
+                desired_image_path=run_desired_rgb_path,
+                desired_pose=run_desired_pose,
+                initial_pose=random_pose,
+                converged=False,
+                iterations_before_converging=0,
+                final_pose=np.full(6, np.nan, dtype=np.float32),
+                final_error=float("nan"),
+            )
+            print(f"[WARN] Gaussian test {t + 1}/{tests} failed with exception: {exc}")
         finally:
             gc.collect()
             if torch.cuda.is_available():
@@ -699,64 +857,64 @@ def geodesic_angle(r1, r2) -> float:
 
 
 if __name__ == "__main__":
-    # parser = argparse.ArgumentParser()
-    # parser.add_argument(
-    #     "--verbose",
-    #     action="store_true",
-    #     help="Show live current-vs-target view while FBVS mesh simulation runs.",
-    # )
-    # parser.add_argument(
-    #     "--dataset-dir",
-    #     type=Path,
-    #     default=Path("data/apt1/living/data"),
-    #     help="Directory containing frame-XXXXXX.{color.jpg,depth.png,pose.txt}",
-    # )
-    # parser.add_argument(
-    #     "--scene-ply",
-    #     type=Path,
-    #     default=Path("data/apt1/living/aliving.ply"),
-    #     help="Path to mesh (.ply) used by fbvs_mesh.",
-    # )
-    # parser.add_argument(
-    #     "--runs-csv",
-    #     type=Path,
-    #     default=Path("logs/fbvs_mesh_runs_05.csv"),
-    #     help="CSV file where each fbvs_mesh run is appended.",
-    # )
-    # parser.add_argument(
-    #     "--tests",
-    #     type=int,
-    #     default=1,
-    #     help="Number of randomized FBVS evaluations to run.",
-    # )
-    # parser.add_argument(
-    #     "--pose-tweak",
-    #     type=float,
-    #     default=0.1,
-    #     help="Relative random perturbation magnitude for each pose element.",
-    # )
-    # parser.add_argument(
-    #     "--summary",
-    #     action="store_true",
-    #     help="Print robustness summary from the runs CSV after evaluation.",
-    # )
-    # parser.add_argument(
-    #     "--summary-only",
-    #     action="store_true",
-    #     help="Only print summary from --runs-csv and exit.",
-    # )
-    # args = parser.parse_args()
-    #
-    # if args.summary_only:
-    #     summarize_mesh_eval(args.runs_csv, print_summary=True)
-    #     raise SystemExit(0)
-    #
-    # if args.verbose:
-    #     print(f"[main] dataset dir: {args.dataset_dir}")
-    #     print("[main] desired frame idx is sampled randomly in [0, 1100] per trial.")
-    #
-    # # Example batch evaluation:
-    # # python main.py --tests 20 --pose-tweak 0.15 --runs-csv logs/fbvs_mesh_runs_05.csv
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Show live current-vs-target view while FBVS mesh simulation runs.",
+    )
+    parser.add_argument(
+        "--dataset-dir",
+        type=Path,
+        default=Path("data/apt1/living/data"),
+        help="Directory containing frame-XXXXXX.{color.jpg,depth.png,pose.txt}",
+    )
+    parser.add_argument(
+        "--scene-ply",
+        type=Path,
+        default=Path("data/apt1/living/aliving.ply"),
+        help="Path to mesh (.ply) used by fbvs_mesh.",
+    )
+    parser.add_argument(
+        "--runs-csv",
+        type=Path,
+        default=Path("logs/fbvs_mesh_runs_05.csv"),
+        help="CSV file where each fbvs_mesh run is appended.",
+    )
+    parser.add_argument(
+        "--tests",
+        type=int,
+        default=1,
+        help="Number of randomized FBVS evaluations to run.",
+    )
+    parser.add_argument(
+        "--pose-tweak",
+        type=float,
+        default=0.1,
+        help="Relative random perturbation magnitude for each pose element.",
+    )
+    parser.add_argument(
+        "--summary",
+        action="store_true",
+        help="Print robustness summary from the runs CSV after evaluation.",
+    )
+    parser.add_argument(
+        "--summary-only",
+        action="store_true",
+        help="Only print summary from --runs-csv and exit.",
+    )
+    args = parser.parse_args()
+
+    if args.summary_only:
+        summarize_mesh_eval(args.runs_csv, print_summary=True)
+        raise SystemExit(0)
+
+    if args.verbose:
+        print(f"[main] dataset dir: {args.dataset_dir}")
+        print("[main] desired frame idx is sampled randomly in [0, 1100] per trial.")
+
+    # Example batch evaluation:
+    # python main.py --tests 20 --pose-tweak 0.15 --runs-csv logs/fbvs_mesh_runs_05.csv
     # mesh_eval(
     #     scene_ply=args.scene_ply,
     #     dataset_dir=args.dataset_dir,
@@ -765,25 +923,49 @@ if __name__ == "__main__":
     #     verbose=args.verbose,
     #     pose_tweak=args.pose_tweak,
     # )
+    #
+    ###################################################################################################################
+    # Example Gaussian evaluation:
+    ###################################################################################################################
+
+    # # python main.py --tests 20 --pose-tweak 0.10 --runs-csv logs/fbvs_gaussian_runs.csv
+    gaussian_eval(
+        scene_ply=Path("data/playroom/playroom.ply"),
+        images_dir=Path("data/playroom/images"),
+        colmap_images_txt=Path("data/playroom/info/images.txt"),
+        tests=args.tests,
+        runs_csv=Path("logs/fbvs_gaussian_runs.csv"),
+        verbose=args.verbose,
+        pose_tweak=args.pose_tweak,
+        K=np.array(
+            [
+                [1040.0073037593279, 0.0, 632.0],
+                [0.0, 1040.1927566661841, 416.0],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float32,
+        ),
+        use_redetect=True,
+    )
     # if args.summary:
     #     summarize_mesh_eval(args.runs_csv, print_summary=True)
-
-    # Example single FBVS simulation (from a given initial pose to a target image) with verbose ON.
-    # Set this to True when you want to run exactly one simulation example.
-    """
-    python main.py --tests 50 --pose-tweak 0.10 --dataset-dir data/apt1/kitchen/data --runs-csv logs/fbvs_mesh_runs_10.csv
-    """
-    example_scene_ply = Path("data/apt1/living/aliving.ply")
-    example_dataset_dir = Path("data/apt1/living/data")
-    example_frame_idx = 13
-
-    desired_rgb_path, _, desired_pose = get_frame_paths_and_pose(
-        example_dataset_dir, example_frame_idx
-    )
-    initial_pose = np.array(
-        [0, 0.1, 1.3, -2.20, -0.2,
-         -0.7], dtype=np.float32
-    )
+    #
+    # # Example single FBVS simulation (from a given initial pose to a target image) with verbose ON.
+    # # Set this to True when you want to run exactly one simulation example.
+    # """
+    # python main.py --tests 50 --pose-tweak 0.10 --dataset-dir data/apt1/kitchen/data --runs-csv logs/fbvs_mesh_runs_10.csv
+    # """
+    # example_scene_ply = Path("data/apt1/living/aliving.ply")
+    # example_dataset_dir = Path("data/apt1/living/data")
+    # example_frame_idx = 13
+    #
+    # desired_rgb_path, _, desired_pose = get_frame_paths_and_pose(
+    #     example_dataset_dir, example_frame_idx
+    # )
+    # initial_pose = np.array(
+    #     [0, 0.1, 1.3, -2.20, -0.2,
+    #      -0.7], dtype=np.float32
+    # )
     #
     # run_metrics = fbvs_mesh(
     #     scene_ply=example_scene_ply,
@@ -804,15 +986,78 @@ if __name__ == "__main__":
     #     f"[single_fbvs_example] position_distance_m={pos_distance_m:.6f}, "
     #     f"geodesic_rotation_rad={geodesic_rot_rad:.6f}"
     # )
-    dvs_mesh(
-        scene_ply=example_scene_ply,
-        initial_pose=desired_pose,
-        desired_view=desired_rgb_path,
-        error_tolerance=0.025,
-        desired_pose=desired_pose,
-        verbose=True,
-        save_frames=True,
-        frames_dir="debug_frames/"
-    )
+    # dvs_mesh(
+    #     scene_ply=example_scene_ply,
+    #     initial_pose=desired_pose,
+    #     desired_view=desired_rgb_path,
+    #     error_tolerance=0.025,
+    #     desired_pose=desired_pose,
+    #     verbose=True,
+    #     save_frames=True,
+    #     frames_dir="debug_frames/"
+    # )
+    ###################################################################################################################
+    # FBVS Gaussian Playroom Example
+    ###################################################################################################################
+    # from src.servoing.gaussian_fbvs import fbvs as fbvs_gaussian, get_pose_colmap
+    #
+    # gaussian_scene_ply = Path("data/playroom/playroom.ply")
+    # gaussian_desired_view = Path("data/playroom/images/DSC05574.jpg")
+    # gaussian_colmap_images = Path("data/playroom/info/images.txt")
+    # gaussian_target_image_id = 3
+    # #
+    # K_gaussian = np.array(
+    #     [
+    #         [1040.0073037593279, 0.0, 632.0],
+    #         [0.0, 1040.1927566661841, 416.0],
+    #         [0.0, 0.0, 1.0],
+    #     ],
+    #     dtype=np.float32,
+    # )
+    # #
+    # desired_pose_gaussian = get_pose_colmap(
+    #     gaussian_target_image_id, path=gaussian_colmap_images
+    # )
+    # if desired_pose_gaussian is None:
+    #     raise ValueError(
+    #         f"Could not find image_id={gaussian_target_image_id} in {gaussian_colmap_images}"
+    #     )
+    #
+    # # Start from a perturbed pose so FBVS has a non-zero control objective.
+    # initial_pose_gaussian = tweak_pose(desired_pose_gaussian, tweak=0.10)
+    #
+    # run_metrics_gaussian = fbvs_gaussian(
+    #     scene=gaussian_scene_ply,
+    #     initial_pose=np.array([ 3.226352  ,  2.006508  , -2.9522364 , -0.23189576,  0.01949945,
+    #     0.42474204]),
+    #     desired_view=gaussian_desired_view,
+    #     K=K_gaussian,
+    #     desired_pose=desired_pose_gaussian,
+    #     error_tolerance=0.035,
+    #     max_iters=20,
+    #     verbose=True,
+    #     save_frames=True,
+    #     frames_dir="debug_frames",
+    #     save_video=True,
+    # )
+    # print(f"[single_fbvs_gaussian_example] {run_metrics_gaussian}")
+    ###################################################################################################################
 
-
+    ###################################################################################################################
+    # FBVS Gaussian Playroom Example (Re-detect + Re-match each iteration)
+    ###################################################################################################################
+    # run_metrics_gaussian_redetect = fbvs_redetect(
+    #     scene=gaussian_scene_ply,
+    #     initial_pose=np.array([ 3.226352  ,  2.006508  , -2.9522364 , -0.23189576,  0.91949945,
+    #     0.42474204]),
+    #     desired_view=gaussian_desired_view,
+    #     K=K_gaussian,
+    #     desired_pose=desired_pose_gaussian,
+    #     error_tolerance=0.035,
+    #     max_iters=50,
+    #     verbose=True,
+    #     save_frames=True,
+    #     frames_dir="debug_frames",
+    #     save_video=True,
+    # )
+    # print(f"[single_fbvs_gaussian_redetect_example] {run_metrics_gaussian_redetect}")

@@ -70,7 +70,9 @@ def dvs_mesh(
 
     camera_pose = np.asarray(initial_pose, dtype=np.float32).reshape(-1).copy()
     if camera_pose.size != 6:
-        raise ValueError(f"initial_pose must have 6 elements, got shape {camera_pose.shape}")
+        raise ValueError(
+            f"initial_pose must have 6 elements, got shape {camera_pose.shape}"
+        )
 
     scene_obj = MeshScene(verbose=verbose)
     scene_obj.load_mesh(str(scene_ply))
@@ -80,7 +82,9 @@ def dvs_mesh(
     cam_h = int(camera.intrinsics.height)
     cam_w = int(camera.intrinsics.width)
 
-    real_bgr, real_gray = _load_and_fit_target(desired_view, cam_w, cam_h, verbose=verbose)
+    real_bgr, real_gray = _load_and_fit_target(
+        desired_view, cam_w, cam_h, verbose=verbose
+    )
 
     video_writer = None
     enable_video = bool(verbose and save_video)
@@ -225,7 +229,9 @@ def dvs_mesh(
                 print(f"[dvs_mesh] Simulation saved to {video_path}")
 
         if enable_frames and frame_output_dir is not None and verbose:
-            print(f"[dvs_mesh] Saved {saved_frame_count} debug frames to {frame_output_dir}")
+            print(
+                f"[dvs_mesh] Saved {saved_frame_count} debug frames to {frame_output_dir}"
+            )
 
         if verbose:
             try:

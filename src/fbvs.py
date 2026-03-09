@@ -16,6 +16,7 @@ from src.servoing import (
     fbvs_gaussian_redetect,
     fbvs_redetect,
     fbvs_mesh,
+    fbvs_mesh_redetect,
     get_features_depth,
     render_view,
 )
@@ -26,6 +27,7 @@ __all__ = [
     "fbvs_redetect",
     "fbvs_gaussian_redetect",
     "fbvs_mesh",
+    "fbvs_mesh_redetect",
     "dvs_mesh",
     "render_view",
     "get_features_depth",

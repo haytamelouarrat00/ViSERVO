@@ -11,12 +11,12 @@ from typing import Any, Optional
 import numpy as np
 import torch
 
-from src.fbvs import fbvs as fbvs_gaussian, fbvs_mesh, dvs_mesh, fbvs_redetect
+from src.fbvs import fbvs as fbvs_gaussian, fbvs_mesh, fbvs_mesh_redetect, dvs_mesh, fbvs_redetect
 from src.scene_ops import pose6_from_T
 
 
 def get_frame_paths_and_pose(
-    dataset_dir: str | Path, frame_idx: int
+        dataset_dir: str | Path, frame_idx: int
 ) -> tuple[Path, Path, np.ndarray]:
     """Return RGB path, depth path, and 6D pose for a dataset frame index."""
     data_dir = Path(dataset_dir)
@@ -41,15 +41,15 @@ def get_frame_paths_and_pose(
 
 
 def append_fbvs_run_to_csv(
-    csv_path: str | Path,
-    *,
-    desired_image_path: Path,
-    desired_pose: np.ndarray,
-    initial_pose: np.ndarray,
-    converged: bool,
-    iterations_before_converging: int,
-    final_pose: np.ndarray,
-    final_error: float,
+        csv_path: str | Path,
+        *,
+        desired_image_path: Path,
+        desired_pose: np.ndarray,
+        initial_pose: np.ndarray,
+        converged: bool,
+        iterations_before_converging: int,
+        final_pose: np.ndarray,
+        final_error: float,
 ) -> None:
     """Append one FBVS mesh run record to CSV (create with header if needed)."""
     csv_path = Path(csv_path)
@@ -179,11 +179,11 @@ def append_fbvs_run_to_csv(
 
 
 def load_moge_model(
-    *,
-    device_name: str,
-    model_version: str = "v2",
-    pretrained_model_name_or_path: Optional[str] = None,
-    use_fp16: bool = False,
+        *,
+        device_name: str,
+        model_version: str = "v2",
+        pretrained_model_name_or_path: Optional[str] = None,
+        use_fp16: bool = False,
 ) -> Any:
     """Load MoGe once so multiple FBVS runs can reuse the same model."""
     try:
@@ -227,18 +227,28 @@ def tweak_pose(pose: np.ndarray, tweak: float = 0.1) -> np.ndarray:
 
 
 def mesh_eval(
-    scene_ply: str | Path,
-    dataset_dir: str | Path,
-    tests: int,
-    runs_csv: str | Path,
-    *,
-    verbose: bool = False,
-    pose_tweak: float = 0.1,
+        scene_ply: str | Path,
+        dataset_dir: str | Path,
+        tests: int,
+        runs_csv: str | Path,
+        *,
+        verbose: bool = False,
+        pose_tweak: float = 0.1,
+        use_redetect: bool = False,
 ) -> None:
-    """Run `fbvs_mesh` multiple times with random desired frame index in [0, 1100]."""
+    """Run `fbvs_mesh` or `fbvs_mesh_redetect` multiple times with random desired frame index in [0, 1100]."""
     dataset_dir = Path(dataset_dir)
     tests = int(tests)
     depth_device_name = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # Select controller based on use_redetect flag
+    controller = fbvs_mesh_redetect if use_redetect else fbvs_mesh
+
+    if verbose:
+        print(
+            f"[mesh_eval] Controller={('fbvs_mesh_redetect' if use_redetect else 'fbvs_mesh')}, "
+            f"tests={tests}, pose_tweak={pose_tweak}"
+        )
 
     # Load MoGe once and reuse it across all trials.
     depth_model: Optional[Any] = None
@@ -264,11 +274,11 @@ def mesh_eval(
                 )
 
             random_pose = tweak_pose(run_desired_pose, tweak=pose_tweak)
-            run_metrics = fbvs_mesh(
+            run_metrics = controller(
                 scene_ply=scene_ply,
                 initial_pose=random_pose,
                 desired_view=run_desired_rgb_path,
-                error_tolerance=0.05,
+                error_tolerance=0.05 if not use_redetect else 0.025,
                 desired_pose=run_desired_pose,
                 verbose=verbose,
                 depth_model=depth_model,
@@ -369,18 +379,18 @@ def _load_colmap_image_entries(images_txt_path: str | Path) -> list[dict[str, An
 
 
 def gaussian_eval(
-    scene_ply: str | Path,
-    images_dir: str | Path,
-    colmap_images_txt: str | Path,
-    tests: int,
-    runs_csv: str | Path,
-    *,
-    verbose: bool = False,
-    pose_tweak: float = 0.1,
-    K: Optional[np.ndarray] = None,
-    error_tolerance: float = 0.035,
-    max_iters: int = 20,
-    use_redetect: bool = True,
+        scene_ply: str | Path,
+        images_dir: str | Path,
+        colmap_images_txt: str | Path,
+        tests: int,
+        runs_csv: str | Path,
+        *,
+        verbose: bool = False,
+        pose_tweak: float = 0.1,
+        K: Optional[np.ndarray] = None,
+        error_tolerance: float = 0.035,
+        max_iters: int = 20,
+        use_redetect: bool = True,
 ) -> None:
     """
     Run Gaussian FBVS multiple times with random desired images from COLMAP `images.txt`.
@@ -547,8 +557,8 @@ def _fmt3(value: Any, *, percent: bool = False) -> str:
         if np.isinf(v):
             return "inf" if v > 0 else "-inf"
         if percent:
-            return f"{100.0 * v:.3f}%"
-        return f"{v:.3f}"
+            return f"{100.0 * v:.5f}%"
+        return f"{v:.5f}"
     return str(value)
 
 
@@ -681,13 +691,13 @@ def summarize_mesh_eval(csv_path: str | Path, *, print_summary: bool = True) -> 
             )
         )
         if (
-            not np.isfinite(geodesic_rot_dist)
-            and desired_pose is not None
-            and final_pose is not None
-            and desired_pose.size >= 6
-            and final_pose.size >= 6
-            and np.all(np.isfinite(desired_pose[3:6]))
-            and np.all(np.isfinite(final_pose[3:6]))
+                not np.isfinite(geodesic_rot_dist)
+                and desired_pose is not None
+                and final_pose is not None
+                and desired_pose.size >= 6
+                and final_pose.size >= 6
+                and np.all(np.isfinite(desired_pose[3:6]))
+                and np.all(np.isfinite(final_pose[3:6]))
         ):
             geodesic_rot_dist = geodesic_angle(desired_pose[3:6], final_pose[3:6])
 
@@ -878,7 +888,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--runs-csv",
         type=Path,
-        default=Path("logs/fbvs_mesh_runs_05.csv"),
+        default=Path("logs/fbvs_mesh_runs_static.csv"),
         help="CSV file where each fbvs_mesh run is appended.",
     )
     parser.add_argument(
@@ -913,8 +923,12 @@ if __name__ == "__main__":
         print(f"[main] dataset dir: {args.dataset_dir}")
         print("[main] desired frame idx is sampled randomly in [0, 1100] per trial.")
 
-    # Example batch evaluation:
-    # python main.py --tests 20 --pose-tweak 0.15 --runs-csv logs/fbvs_mesh_runs_05.csv
+    ###################################################################################################################
+    # BATCH EVALUATION: FBVS Mesh - Static Features (Multiple Random Tests)
+    ###################################################################################################################
+    # Run multiple FBVS mesh tests using static feature tracking.
+    # Usage: python main.py --tests 100 --pose-tweak 0.3 --runs-csv logs/fbvs_mesh_runs_static.csv
+    #
     # mesh_eval(
     #     scene_ply=args.scene_ply,
     #     dataset_dir=args.dataset_dir,
@@ -922,39 +936,94 @@ if __name__ == "__main__":
     #     runs_csv=args.runs_csv,
     #     verbose=args.verbose,
     #     pose_tweak=args.pose_tweak,
+    #     use_redetect=True,
     # )
-    #
-    ###################################################################################################################
-    # Example Gaussian evaluation:
-    ###################################################################################################################
-
-    # # python main.py --tests 20 --pose-tweak 0.10 --runs-csv logs/fbvs_gaussian_runs.csv
-    gaussian_eval(
-        scene_ply=Path("data/playroom/playroom.ply"),
-        images_dir=Path("data/playroom/images"),
-        colmap_images_txt=Path("data/playroom/info/images.txt"),
-        tests=args.tests,
-        runs_csv=Path("logs/fbvs_gaussian_runs.csv"),
-        verbose=args.verbose,
-        pose_tweak=args.pose_tweak,
-        K=np.array(
-            [
-                [1040.0073037593279, 0.0, 632.0],
-                [0.0, 1040.1927566661841, 416.0],
-                [0.0, 0.0, 1.0],
-            ],
-            dtype=np.float32,
-        ),
-        use_redetect=True,
-    )
     # if args.summary:
     #     summarize_mesh_eval(args.runs_csv, print_summary=True)
+
+    ###################################################################################################################
+    # BATCH EVALUATION: FBVS Mesh - Dynamic Features (Multiple Random Tests)
+    ###################################################################################################################
+    # Run multiple FBVS mesh tests using dynamic feature re-detection each iteration.
+    # Usage: python main.py --tests 100 --pose-tweak 0.3 --runs-csv logs/fbvs_mesh_runs_dynamic.csv
     #
-    # # Example single FBVS simulation (from a given initial pose to a target image) with verbose ON.
-    # # Set this to True when you want to run exactly one simulation example.
-    # """
-    # python main.py --tests 50 --pose-tweak 0.10 --dataset-dir data/apt1/kitchen/data --runs-csv logs/fbvs_mesh_runs_10.csv
-    # """
+    # mesh_eval(
+    #     scene_ply=args.scene_ply,
+    #     dataset_dir=args.dataset_dir,
+    #     tests=args.tests,
+    #     runs_csv=Path("logs/fbvs_mesh_runs_dynamic.csv"),
+    #     verbose=args.verbose,
+    #     pose_tweak=args.pose_tweak,
+    #     use_redetect=True,
+    # )
+    # if args.summary:
+    #     summarize_mesh_eval(Path("logs/fbvs_mesh_runs_dynamic.csv"), print_summary=True)
+    #
+    # #################################################################################################################
+    # BATCH EVALUATION: FBVS Gaussian - Static Features (Multiple Random Tests)
+    ###################################################################################################################
+    # Run multiple FBVS Gaussian tests using static feature tracking (features from first frame).
+    # Usage: python main.py --tests 100 --pose-tweak 0.10 --runs-csv logs/fbvs_gaussian_runs_static.csv
+    #
+    # gaussian_eval(
+    #     scene_ply=Path("data/playroom/playroom.ply"),
+    #     images_dir=Path("data/playroom/images"),
+    #     colmap_images_txt=Path("data/playroom/info/images.txt"),
+    #     tests=args.tests,
+    #     runs_csv=Path("logs/fbvs_gaussian_runs_static.csv"),
+    #     verbose=args.verbose,
+    #     pose_tweak=args.pose_tweak,
+    #     K=np.array(
+    #         [
+    #             [1040.0073037593279, 0.0, 632.0],
+    #             [0.0, 1040.1927566661841, 416.0],
+    #             [0.0, 0.0, 1.0],
+    #         ],
+    #         dtype=np.float32,
+    #     ),
+    #     error_tolerance=0.035,
+    #     max_iters=20,
+    #     use_redetect=False,
+    # )
+    # if args.summary:
+    #     summarize_mesh_eval(Path("logs/fbvs_gaussian_runs_static.csv"), print_summary=True)
+
+    ###################################################################################################################
+    # BATCH EVALUATION: FBVS Gaussian - Dynamic Features (Multiple Random Tests)
+    ###################################################################################################################
+    # Run multiple FBVS Gaussian tests using dynamic feature re-detection each iteration.
+    # This approach performs ~15x better in position accuracy and ~25x better in rotation accuracy.
+    # Usage: python main.py --tests 100 --pose-tweak 0.10 --runs-csv logs/fbvs_gaussian_runs_dynamic.csv
+    #
+    # gaussian_eval(
+    #     scene_ply=Path("data/playroom/playroom.ply"),
+    #     images_dir=Path("data/playroom/images"),
+    #     colmap_images_txt=Path("data/playroom/info/images.txt"),
+    #     tests=args.tests,
+    #     runs_csv=Path("logs/fbvs_gaussian_runs_dynamic.csv"),
+    #     verbose=args.verbose,
+    #     pose_tweak=args.pose_tweak,
+    #     K=np.array(
+    #         [
+    #             [1040.0073037593279, 0.0, 632.0],
+    #             [0.0, 1040.1927566661841, 416.0],
+    #             [0.0, 0.0, 1.0],
+    #         ],
+    #         dtype=np.float32,
+    #     ),
+    #     error_tolerance=0.035,
+    #     max_iters=20,
+    #     use_redetect=True,
+    # )
+    # if args.summary:
+    #     summarize_mesh_eval(Path("logs/fbvs_gaussian_runs_dynamic.csv"), print_summary=True)
+
+    ###################################################################################################################
+    # SINGLE EXAMPLE: FBVS Mesh - Static Features
+    ###################################################################################################################
+    # Run a single FBVS mesh simulation using static feature tracking.
+    # Useful for debugging and visualization with verbose output.
+    #
     # example_scene_ply = Path("data/apt1/living/aliving.ply")
     # example_dataset_dir = Path("data/apt1/living/data")
     # example_frame_idx = 13
@@ -962,30 +1031,44 @@ if __name__ == "__main__":
     # desired_rgb_path, _, desired_pose = get_frame_paths_and_pose(
     #     example_dataset_dir, example_frame_idx
     # )
-    # initial_pose = np.array(
-    #     [0, 0.1, 1.3, -2.20, -0.2,
-    #      -0.7], dtype=np.float32
-    # )
-    #
+    # initial_pose = np.array([0, 0.1, 1.3, -2.20, -0.2, -0.7], dtype=np.float32)
+    # tweaked_pose = tweak_pose(desired_pose, tweak=0.2)
     # run_metrics = fbvs_mesh(
     #     scene_ply=example_scene_ply,
-    #     initial_pose=initial_pose,
+    #     initial_pose=tweaked_pose,
     #     desired_view=desired_rgb_path,
-    #     error_tolerance=0.025,
+    #     error_tolerance=0.05,
     #     desired_pose=desired_pose,
     #     verbose=True,
     #     save_frames=True,
-    #     frames_dir="debug_frames/"
+    #     frames_dir="debug_frames/",
     # )
-    # print(f"[single_fbvs_example] {run_metrics}")
+    # print(f"[single_fbvs_mesh_static_example] {run_metrics}")
+    #
+    # # Compute final accuracy metrics
     # final_pose = np.asarray(run_metrics["final_pose"], dtype=np.float32).reshape(-1)
     # desired_pose_arr = np.asarray(desired_pose, dtype=np.float32).reshape(-1)
     # pos_distance_m = float(np.linalg.norm(desired_pose_arr[:3] - final_pose[:3]))
     # geodesic_rot_rad = geodesic_angle(desired_pose_arr[3:6], final_pose[3:6])
     # print(
-    #     f"[single_fbvs_example] position_distance_m={pos_distance_m:.6f}, "
+    #     f"[single_fbvs_mesh_static_example] position_distance_m={pos_distance_m:.6f}, "
     #     f"geodesic_rotation_rad={geodesic_rot_rad:.6f}"
     # )
+
+    ###################################################################################################################
+    # SINGLE EXAMPLE: DVS Mesh (Direct Visual Servoing)
+    ###################################################################################################################
+    # Run a single DVS mesh simulation starting from the desired pose itself.
+    # Useful for testing depth estimation and control in ideal conditions.
+    #
+    # example_scene_ply = Path("data/apt1/living/aliving.ply")
+    # example_dataset_dir = Path("data/apt1/living/data")
+    # example_frame_idx = 13
+    #
+    # desired_rgb_path, _, desired_pose = get_frame_paths_and_pose(
+    #     example_dataset_dir, example_frame_idx
+    # )
+    #
     # dvs_mesh(
     #     scene_ply=example_scene_ply,
     #     initial_pose=desired_pose,
@@ -994,18 +1077,61 @@ if __name__ == "__main__":
     #     desired_pose=desired_pose,
     #     verbose=True,
     #     save_frames=True,
-    #     frames_dir="debug_frames/"
+    #     frames_dir="debug_frames/",
     # )
+
     ###################################################################################################################
-    # FBVS Gaussian Playroom Example
+    # SINGLE EXAMPLE: FBVS Mesh - Dynamic Features (RECOMMENDED)
     ###################################################################################################################
+    # Run a single FBVS mesh simulation using dynamic feature re-detection.
+    # Features are re-detected and re-matched every iteration for better accuracy.
+    # Similar to Gaussian, this approach should perform significantly better than static feature tracking.
+    #
+    # example_scene_ply = Path("data/apt1/living/aliving.ply")
+    # example_dataset_dir = Path("data/apt1/living/data")
+    # example_frame_idx = 13
+    #
+    # desired_rgb_path, _, desired_pose = get_frame_paths_and_pose(
+    #     example_dataset_dir, example_frame_idx
+    # )
+    # initial_pose = np.array([0, 0.1, 1.3, -2.20, -0.2, -0.7], dtype=np.float32)
+    #
+    # run_metrics = fbvs_mesh_redetect(
+    #     scene_ply=example_scene_ply,
+    #     initial_pose=initial_pose,
+    #     desired_view=desired_rgb_path,
+    #     error_tolerance=0.025,
+    #     desired_pose=desired_pose,
+    #     verbose=True,
+    #     save_frames=True,
+    #     frames_dir="debug_frames/",
+    #     max_iters=100,
+    # )
+    # print(f"[single_fbvs_mesh_redetect_example] {run_metrics}")
+    #
+    # # Compute final accuracy metrics
+    # final_pose = np.asarray(run_metrics["final_pose"], dtype=np.float32).reshape(-1)
+    # desired_pose_arr = np.asarray(desired_pose, dtype=np.float32).reshape(-1)
+    # pos_distance_m = float(np.linalg.norm(desired_pose_arr[:3] - final_pose[:3]))
+    # geodesic_rot_rad = geodesic_angle(desired_pose_arr[3:6], final_pose[3:6])
+    # print(
+    #     f"[single_fbvs_mesh_redetect_example] position_distance_m={pos_distance_m:.6f}, "
+    #     f"geodesic_rotation_rad={geodesic_rot_rad:.6f}"
+    # )
+
+    ###################################################################################################################
+    # SINGLE EXAMPLE: FBVS Gaussian - Static Features
+    ###################################################################################################################
+    # Run a single FBVS Gaussian simulation using static feature tracking.
+    # Features are detected once at the beginning and tracked throughout.
+    #
     # from src.servoing.gaussian_fbvs import fbvs as fbvs_gaussian, get_pose_colmap
     #
     # gaussian_scene_ply = Path("data/playroom/playroom.ply")
     # gaussian_desired_view = Path("data/playroom/images/DSC05574.jpg")
     # gaussian_colmap_images = Path("data/playroom/info/images.txt")
     # gaussian_target_image_id = 3
-    # #
+    #
     # K_gaussian = np.array(
     #     [
     #         [1040.0073037593279, 0.0, 632.0],
@@ -1014,7 +1140,7 @@ if __name__ == "__main__":
     #     ],
     #     dtype=np.float32,
     # )
-    # #
+    #
     # desired_pose_gaussian = get_pose_colmap(
     #     gaussian_target_image_id, path=gaussian_colmap_images
     # )
@@ -1023,13 +1149,14 @@ if __name__ == "__main__":
     #         f"Could not find image_id={gaussian_target_image_id} in {gaussian_colmap_images}"
     #     )
     #
-    # # Start from a perturbed pose so FBVS has a non-zero control objective.
+    # # Start from a perturbed pose so FBVS has a non-zero control objective
     # initial_pose_gaussian = tweak_pose(desired_pose_gaussian, tweak=0.10)
+    # # Or use a specific initial pose:
+    # # initial_pose_gaussian = np.array([3.226352, 2.006508, -2.9522364, -0.23189576, 0.01949945, 0.42474204])
     #
     # run_metrics_gaussian = fbvs_gaussian(
     #     scene=gaussian_scene_ply,
-    #     initial_pose=np.array([ 3.226352  ,  2.006508  , -2.9522364 , -0.23189576,  0.01949945,
-    #     0.42474204]),
+    #     initial_pose=initial_pose_gaussian,
     #     desired_view=gaussian_desired_view,
     #     K=K_gaussian,
     #     desired_pose=desired_pose_gaussian,
@@ -1040,16 +1167,47 @@ if __name__ == "__main__":
     #     frames_dir="debug_frames",
     #     save_video=True,
     # )
-    # print(f"[single_fbvs_gaussian_example] {run_metrics_gaussian}")
-    ###################################################################################################################
+    # print(f"[single_fbvs_gaussian_static_example] {run_metrics_gaussian}")
 
     ###################################################################################################################
-    # FBVS Gaussian Playroom Example (Re-detect + Re-match each iteration)
+    # SINGLE EXAMPLE: FBVS Gaussian - Dynamic Features (RECOMMENDED)
     ###################################################################################################################
+    # Run a single FBVS Gaussian simulation using dynamic feature re-detection.
+    # Features are re-detected and re-matched every iteration for better accuracy.
+    # This approach performs significantly better than static feature tracking.
+    #
+    # from src.servoing.gaussian_fbvs import get_pose_colmap
+    #
+    # gaussian_scene_ply = Path("data/playroom/playroom.ply")
+    # gaussian_desired_view = Path("data/playroom/images/DSC05574.jpg")
+    # gaussian_colmap_images = Path("data/playroom/info/images.txt")
+    # gaussian_target_image_id = 3
+    #
+    # K_gaussian = np.array(
+    #     [
+    #         [1040.0073037593279, 0.0, 632.0],
+    #         [0.0, 1040.1927566661841, 416.0],
+    #         [0.0, 0.0, 1.0],
+    #     ],
+    #     dtype=np.float32,
+    # )
+    #
+    # desired_pose_gaussian = get_pose_colmap(
+    #     gaussian_target_image_id, path=gaussian_colmap_images
+    # )
+    # if desired_pose_gaussian is None:
+    #     raise ValueError(
+    #         f"Could not find image_id={gaussian_target_image_id} in {gaussian_colmap_images}"
+    #     )
+    #
+    # # Start from a perturbed pose so FBVS has a non-zero control objective
+    # initial_pose_gaussian = tweak_pose(desired_pose_gaussian, tweak=0.10)
+    # # Or use a specific initial pose:
+    # # initial_pose_gaussian = np.array([3.226352, 2.006508, -2.9522364, -0.23189576, 0.91949945, 0.42474204])
+    #
     # run_metrics_gaussian_redetect = fbvs_redetect(
     #     scene=gaussian_scene_ply,
-    #     initial_pose=np.array([ 3.226352  ,  2.006508  , -2.9522364 , -0.23189576,  0.91949945,
-    #     0.42474204]),
+    #     initial_pose=initial_pose_gaussian,
     #     desired_view=gaussian_desired_view,
     #     K=K_gaussian,
     #     desired_pose=desired_pose_gaussian,
@@ -1060,4 +1218,55 @@ if __name__ == "__main__":
     #     frames_dir="debug_frames",
     #     save_video=True,
     # )
-    # print(f"[single_fbvs_gaussian_redetect_example] {run_metrics_gaussian_redetect}")
+    # print(f"[single_fbvs_gaussian_dynamic_example] {run_metrics_gaussian_redetect}")
+
+    ###################################################################################################################
+    # SINGLE EXAMPLE: DVS Gaussian
+    ###################################################################################################################
+    # Run a single Direct Visual Servoing simulation on a Gaussian Splatting scene.
+    # Uses dense photometric error (ZN Gauss-Newton) instead of sparse feature matching.
+    #
+    from src.servoing.gaussian_dvs import gaussian_dvs
+    from src.servoing.gaussian_fbvs import get_pose_colmap
+
+    gaussian_scene_ply = Path("data/playroom/playroom.ply")
+    gaussian_desired_view = Path("data/playroom/images/DSC05574.jpg")
+    gaussian_colmap_images = Path("data/playroom/info/images.txt")
+    gaussian_target_image_id = 3
+
+    K_gaussian = np.array(
+        [
+            [1040.0073037593279, 0.0, 632.0],
+            [0.0, 1040.1927566661841, 416.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+
+    desired_pose_gaussian = get_pose_colmap(
+        gaussian_target_image_id, path=gaussian_colmap_images
+    )
+    if desired_pose_gaussian is None:
+        raise ValueError(
+            f"Could not find image_id={gaussian_target_image_id} in {gaussian_colmap_images}"
+        )
+
+    initial_pose_gaussian = tweak_pose(desired_pose_gaussian, tweak=0.10)
+
+    run_metrics_dvs = gaussian_dvs(
+        scene=gaussian_scene_ply,
+        initial_pose=desired_pose_gaussian,
+        desired_view=gaussian_desired_view,
+        K=K_gaussian,
+        desired_pose=desired_pose_gaussian,
+        cost_tolerance=1e3,
+        gain=4.0,
+        max_iters=20,
+        verbose=True,
+        save_frames=True,
+        frames_dir="debug_frames",
+        save_video=True,
+    )
+    print(f"[single_dvs_gaussian_example] {run_metrics_dvs}")
+
+    ###################################################################################################################

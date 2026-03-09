@@ -2,6 +2,7 @@ from src.camera import VirtualCamera
 import numpy as np
 import cv2
 
+
 def geometric_error(
     desired_features: np.ndarray, current_features: np.ndarray
 ) -> tuple[np.ndarray, float]:
@@ -55,6 +56,14 @@ def ZNSSD(
     znssd_error = numerator / denominator
 
     return znssd_error
+
+def normalize_image(image: np.ndarray) -> np.ndarray:
+    mean = np.mean(image)
+    std = np.std(image)
+    if std < 1e-8:
+        raise ValueError("Standard deviation is too small for normalization.")
+    normalized = (image - mean) / std
+    return normalized.astype(np.float32)
 
 
 def normalize_features(features: np.ndarray, camera: VirtualCamera) -> np.ndarray:
@@ -143,6 +152,7 @@ def velocity(L: np.ndarray, error: np.ndarray, gain: float = 1.0) -> np.ndarray:
     v = -float(gain) * (L_pinv @ error)
     return np.asarray(v, dtype=np.float32).reshape(6)
 
+
 def _to_intensity_float255(image: np.ndarray) -> np.ndarray:
     """Convert image intensities to float64 in the [0, 255] domain when possible."""
     arr = np.asarray(image, dtype=np.float64)
@@ -175,7 +185,7 @@ def photometric_error(
         )
 
     error = (current - desired).reshape(-1)
-    cost = 1/2 * float(error @ error)
+    cost = 1 / 2 * float(error @ error)
     return error, cost
 
 
@@ -191,7 +201,9 @@ def luminance_interaction_matrix(
     Ix_arr = np.asarray(Ix, dtype=np.float64)
     Iy_arr = np.asarray(Iy, dtype=np.float64)
     if Ix_arr.shape != Iy_arr.shape:
-        raise ValueError(f"Ix and Iy must have same shape, got {Ix_arr.shape} vs {Iy_arr.shape}")
+        raise ValueError(
+            f"Ix and Iy must have same shape, got {Ix_arr.shape} vs {Iy_arr.shape}"
+        )
     if Ix_arr.ndim != 2:
         raise ValueError(f"Ix and Iy must be 2D, got {Ix_arr.shape}")
 
@@ -201,7 +213,9 @@ def luminance_interaction_matrix(
     else:
         depth_arr = np.asarray(depth, dtype=np.float64)
         if depth_arr.shape != (h, w):
-            raise ValueError(f"Depth shape must match image shape {(h, w)}, got {depth_arr.shape}")
+            raise ValueError(
+                f"Depth shape must match image shape {(h, w)}, got {depth_arr.shape}"
+            )
 
     valid = np.isfinite(depth_arr) & (depth_arr > 1e-6)
     if not np.any(valid):
@@ -289,12 +303,12 @@ from typing import Tuple, Optional
 
 class PhotometricVisualServoingZN:
     def __init__(
-            self,
-            camera: VirtualCamera,
-            lambda_gain: float = 1.0,
-            use_zero_mean_normalization: bool = True,
-            use_gradient_magnitude: bool = False,
-            verbose: bool = False,
+        self,
+        camera: VirtualCamera,
+        lambda_gain: float = 1.0,
+        use_zero_mean_normalization: bool = True,
+        use_gradient_magnitude: bool = False,
+        verbose: bool = False,
     ):
         """
         Zero-mean Normalized Photometric Visual Servoing
@@ -344,9 +358,7 @@ class PhotometricVisualServoingZN:
         return I_normalized
 
     def compute_photometric_error(
-            self,
-            I_current: np.ndarray,
-            I_desired: np.ndarray
+        self, I_current: np.ndarray, I_desired: np.ndarray
     ) -> Tuple[np.ndarray, float]:
         """
         Compute photometric error with Zero-mean Normalization.
@@ -372,16 +384,16 @@ class PhotometricVisualServoingZN:
         error = (I_curr_norm - I_des_norm).flatten()
 
         # Compute cost function C(ξ) = 0.5 * ||e||² (Eq. 2)
-        cost = 0.5 * float(np.sum(error ** 2))
+        cost = 0.5 * float(np.sum(error**2))
 
         return error, cost
 
     def compute_gradient_magnitude_error(
-            self,
-            Ix_curr: np.ndarray,
-            Iy_curr: np.ndarray,
-            Ix_des: np.ndarray,
-            Iy_des: np.ndarray
+        self,
+        Ix_curr: np.ndarray,
+        Iy_curr: np.ndarray,
+        Ix_des: np.ndarray,
+        Iy_des: np.ndarray,
     ) -> Tuple[np.ndarray, float]:
         """Use gradient magnitude instead of intensity."""
         Ix_curr = np.asarray(Ix_curr, dtype=np.float64)
@@ -402,8 +414,8 @@ class PhotometricVisualServoingZN:
                 f"Current and desired gradient shapes must match: {Ix_curr.shape} vs {Ix_des.shape}"
             )
 
-        mag_curr = np.sqrt(Ix_curr ** 2 + Iy_curr ** 2)
-        mag_des = np.sqrt(Ix_des ** 2 + Iy_des ** 2)
+        mag_curr = np.sqrt(Ix_curr**2 + Iy_curr**2)
+        mag_des = np.sqrt(Ix_des**2 + Iy_des**2)
 
         # Apply ZN to gradient magnitudes
         if self.use_zn:
@@ -411,16 +423,16 @@ class PhotometricVisualServoingZN:
             mag_des = self.zero_mean_normalize(mag_des)
 
         error = (mag_curr - mag_des).flatten()
-        cost = 0.5 * float(np.sum(error ** 2))
+        cost = 0.5 * float(np.sum(error**2))
 
         return error, cost
 
     def compute_interaction_matrix(
-            self,
-            Ix: np.ndarray,
-            Iy: np.ndarray,
-            Z: float | np.ndarray,
-            camera: VirtualCamera
+        self,
+        Ix: np.ndarray,
+        Iy: np.ndarray,
+        Z: float | np.ndarray,
+        camera: VirtualCamera,
     ) -> np.ndarray:
         """
         Compute luminance interaction matrix L_Ĩ.
@@ -437,14 +449,14 @@ class PhotometricVisualServoingZN:
         return luminance_interaction_matrix(Ix=Ix, Iy=Iy, depth=Z, camera=camera)
 
     def compute_control_velocity(
-            self,
-            I_current: np.ndarray,
-            I_desired: np.ndarray,
-            Ix: np.ndarray,
-            Iy: np.ndarray,
-            Z: float | np.ndarray,
-            Ix_des: Optional[np.ndarray] = None,
-            Iy_des: Optional[np.ndarray] = None,
+        self,
+        I_current: np.ndarray,
+        I_desired: np.ndarray,
+        Ix: np.ndarray,
+        Iy: np.ndarray,
+        Z: float | np.ndarray,
+        Ix_des: Optional[np.ndarray] = None,
+        Iy_des: Optional[np.ndarray] = None,
     ) -> Tuple[np.ndarray, float]:
         """
         Compute camera velocity using Gauss-Newton control law.
@@ -498,9 +510,11 @@ class PhotometricVisualServoingZN:
             self.converged = True
 
         if self.verbose and len(self.cost_history) % 10 == 0:
-            print(f"[dvs_zn] Iter {len(self.cost_history)}: "
-                  f"cost={cost:.2e}, ||v||={velocity_norm:.4f}, "
-                  f"converged={self.converged}")
+            print(
+                f"[dvs_zn] Iter {len(self.cost_history)}: "
+                f"cost={cost:.2e}, ||v||={velocity_norm:.4f}, "
+                f"converged={self.converged}"
+            )
 
         return np.asarray(v, dtype=np.float32).reshape(6), float(cost)
 
@@ -515,11 +529,11 @@ class PhotometricVisualServoingZN:
             return {}
 
         return {
-            'iterations': len(self.cost_history),
-            'initial_cost': self.cost_history[0],
-            'final_cost': self.cost_history[-1],
-            'cost_reduction': self.cost_history[0] / (self.cost_history[-1] + 1e-10),
-            'converged': self.converged,
+            "iterations": len(self.cost_history),
+            "initial_cost": self.cost_history[0],
+            "final_cost": self.cost_history[-1],
+            "cost_reduction": self.cost_history[0] / (self.cost_history[-1] + 1e-10),
+            "converged": self.converged,
         }
 
 

@@ -9,7 +9,12 @@ import torch
 from scipy.spatial.transform import Rotation as R
 
 from src.camera import create_camera_from_K
-from src.control import geometric_error, interaction_matrix, normalize_features, velocity
+from src.control import (
+    geometric_error,
+    interaction_matrix,
+    normalize_features,
+    velocity,
+)
 from src.features import XFeatMatcher
 from src.render_pipeline import render_gaussian_view
 from src.servoing.target_io import _load_and_fit_target
@@ -32,7 +37,9 @@ def _infer_camera_size_from_K(K: np.ndarray) -> tuple[int, int]:
     width = int(round(float(K_arr[0, 2]) * 2.0))
     height = int(round(float(K_arr[1, 2]) * 2.0))
     if width <= 0 or height <= 0:
-        raise ValueError(f"Invalid inferred camera size from K: width={width}, height={height}")
+        raise ValueError(
+            f"Invalid inferred camera size from K: width={width}, height={height}"
+        )
     return width, height
 
 
@@ -89,8 +96,12 @@ def _init_features_and_world_points(
         match_result.matches,
     )
 
-    tracked_features_px = np.array([kp1[m.queryIdx].pt for m in matches], dtype=np.float32)
-    desired_features_px = np.array([kp2[m.trainIdx].pt for m in matches], dtype=np.float32)
+    tracked_features_px = np.array(
+        [kp1[m.queryIdx].pt for m in matches], dtype=np.float32
+    )
+    desired_features_px = np.array(
+        [kp2[m.trainIdx].pt for m in matches], dtype=np.float32
+    )
 
     desired_features_norm = normalize_features(desired_features_px, camera=camera)
 
@@ -113,6 +124,7 @@ def _init_features_and_world_points(
         desired_features_norm,
         feature_points_world,
     )
+
 
 def get_pose_colmap(
     image_id: int, path: str | Path = "data/playroom/info/images.txt"
@@ -194,7 +206,9 @@ def fbvs(
 ):
     camera_pose = np.asarray(initial_pose, dtype=np.float32).copy()
     if camera_pose.size != 6:
-        raise ValueError(f"initial_pose must have 6 elements, got shape {camera_pose.shape}")
+        raise ValueError(
+            f"initial_pose must have 6 elements, got shape {camera_pose.shape}"
+        )
     scene_pose_np = np.zeros(6, dtype=np.float32)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -269,7 +283,9 @@ def fbvs(
             render_rgb = np.asarray(result.rgb, dtype=np.float32)
             render_depth = np.asarray(result.depth, dtype=np.float32)
 
-            current_features_px = camera.project_points(feature_points_world).astype(np.float32)
+            current_features_px = camera.project_points(feature_points_world).astype(
+                np.float32
+            )
 
             points_h = np.hstack(
                 [
@@ -319,16 +335,22 @@ def fbvs(
                     if cv2.imwrite(str(frame_path), panel):
                         saved_frame_count += 1
                     elif verbose:
-                        print(f"[fbvs_gaussian] Failed to write debug frame: {frame_path}")
+                        print(
+                            f"[fbvs_gaussian] Failed to write debug frame: {frame_path}"
+                        )
 
                 if verbose:
                     _safe_imshow(vis_window_name, panel, vis_wait_ms)
 
-            current_features_norm = normalize_features(current_features_px[valid], camera=camera)
+            current_features_norm = normalize_features(
+                current_features_px[valid], camera=camera
+            )
             desired_features_norm_valid = desired_features_norm[valid]
             current_features_depths_valid = current_features_depths[valid]
 
-            error, norm = geometric_error(desired_features_norm_valid, current_features_norm)
+            error, norm = geometric_error(
+                desired_features_norm_valid, current_features_norm
+            )
             last_rendered_features = current_features_norm
             last_real_features = desired_features_norm_valid
 
@@ -376,7 +398,9 @@ def fbvs(
             print(f"Final Difference: position => {diff[:3]}, rotation => {diff[3:]}")
 
     if last_rendered_features is None or last_real_features is None:
-        raise RuntimeError("FBVS Gaussian loop did not produce any feature correspondences.")
+        raise RuntimeError(
+            "FBVS Gaussian loop did not produce any feature correspondences."
+        )
 
     metrics = {
         "converged": bool(converged),
@@ -412,7 +436,9 @@ def fbvs_redetect(
     """
     camera_pose = np.asarray(initial_pose, dtype=np.float32).copy()
     if camera_pose.size != 6:
-        raise ValueError(f"initial_pose must have 6 elements, got shape {camera_pose.shape}")
+        raise ValueError(
+            f"initial_pose must have 6 elements, got shape {camera_pose.shape}"
+        )
     scene_pose_np = np.zeros(6, dtype=np.float32)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -473,8 +499,12 @@ def fbvs_redetect(
             desired_features_px = np.array(
                 [kp_qry[m.trainIdx].pt for m in matches], dtype=np.float32
             ).reshape(-1, 2)
-            current_features_depths = get_features_depth(current_features_px, render_depth)
-            current_features_depths = np.asarray(current_features_depths, dtype=np.float32)
+            current_features_depths = get_features_depth(
+                current_features_px, render_depth
+            )
+            current_features_depths = np.asarray(
+                current_features_depths, dtype=np.float32
+            )
             valid = current_features_depths > 1e-6
 
             if np.sum(valid) < 3:
@@ -512,8 +542,12 @@ def fbvs_redetect(
                 if verbose:
                     _safe_imshow(vis_window_name, panel, vis_wait_ms)
 
-            current_features_norm = normalize_features(current_features_px[valid], camera=camera)
-            desired_features_norm = normalize_features(desired_features_px[valid], camera=camera)
+            current_features_norm = normalize_features(
+                current_features_px[valid], camera=camera
+            )
+            desired_features_norm = normalize_features(
+                desired_features_px[valid], camera=camera
+            )
             current_features_depths_valid = current_features_depths[valid]
 
             error, norm = geometric_error(desired_features_norm, current_features_norm)
@@ -558,7 +592,9 @@ def fbvs_redetect(
         scene_obj.cleanup()
 
     print(f"[fbvs_gaussian_redetect] converged={converged}")
-    print(f"[fbvs_gaussian_redetect] final_pose={[round(x, 3) for x in camera_pose.flatten()]}")
+    print(
+        f"[fbvs_gaussian_redetect] final_pose={[round(x, 3) for x in camera_pose.flatten()]}"
+    )
     if desired_pose is not None:
         desired_pose_arr = np.asarray(desired_pose, dtype=np.float32).reshape(-1)
         if desired_pose_arr.size >= 6:

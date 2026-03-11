@@ -178,6 +178,77 @@ def append_fbvs_run_to_csv(
         writer.writerow(row)
 
 
+def append_dvs_run_to_csv(
+        csv_path: str | Path,
+        *,
+        desired_image_path: Path,
+        desired_pose: np.ndarray,
+        initial_pose: np.ndarray,
+        converged: bool,
+        iterations_before_converging: int,
+        final_pose: np.ndarray,
+        final_cost: float,
+        interaction_matrix_type: str = "current",
+) -> None:
+    """Append one Gaussian DVS run record to CSV (create with header if needed)."""
+    csv_path = Path(csv_path)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+
+    fieldnames = [
+        "run_datetime[iso8601]",
+        "desired_image_path[path]",
+        "desired_pose[x,y,z(m),rx,ry,rz(rad)]",
+        "initial_pose[x,y,z(m),rx,ry,rz(rad)]",
+        "convergence_status[Success|Failed]",
+        "iterations_before_converging[count]",
+        "final_pose[x,y,z(m),rx,ry,rz(rad)]",
+        "final_cost[photometric]",
+        "interaction_matrix_type[current|desired|mean]",
+        "pose_diff_position[dx,dy,dz(m)]",
+        "pose_diff_rotation[drx,dry,drz(rad)]",
+        "position_euclidean_distance[m]",
+        "geodesic_rotation_distance[rad]",
+    ]
+
+    desired_pose_arr = np.asarray(desired_pose, dtype=float).reshape(-1)
+    final_pose_arr = np.asarray(final_pose, dtype=float).reshape(-1)
+    pose_diff = desired_pose_arr - final_pose_arr
+    pose_diff_position = pose_diff[:3]
+    pose_diff_rotation = pose_diff[3:]
+    position_euclidean_distance = float(np.linalg.norm(pose_diff_position))
+    geodesic_rotation_distance = float("nan")
+    if desired_pose_arr.size >= 6 and final_pose_arr.size >= 6:
+        if np.all(np.isfinite(desired_pose_arr[3:6])) and np.all(np.isfinite(final_pose_arr[3:6])):
+            geodesic_rotation_distance = geodesic_angle(
+                desired_pose_arr[3:6], final_pose_arr[3:6]
+            )
+
+    row = {
+        "run_datetime[iso8601]": datetime.now().isoformat(timespec="seconds"),
+        "desired_image_path[path]": str(desired_image_path),
+        "desired_pose[x,y,z(m),rx,ry,rz(rad)]": json.dumps(desired_pose_arr.tolist()),
+        "initial_pose[x,y,z(m),rx,ry,rz(rad)]": json.dumps(
+            np.asarray(initial_pose, dtype=float).tolist()
+        ),
+        "convergence_status[Success|Failed]": "Success" if bool(converged) else "Failed",
+        "iterations_before_converging[count]": int(iterations_before_converging),
+        "final_pose[x,y,z(m),rx,ry,rz(rad)]": json.dumps(final_pose_arr.tolist()),
+        "final_cost[photometric]": float(final_cost),
+        "interaction_matrix_type[current|desired|mean]": str(interaction_matrix_type),
+        "pose_diff_position[dx,dy,dz(m)]": json.dumps(pose_diff_position.tolist()),
+        "pose_diff_rotation[drx,dry,drz(rad)]": json.dumps(pose_diff_rotation.tolist()),
+        "position_euclidean_distance[m]": position_euclidean_distance,
+        "geodesic_rotation_distance[rad]": geodesic_rotation_distance,
+    }
+
+    write_header = not csv_path.exists() or csv_path.stat().st_size == 0
+    with csv_path.open("a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+
+
 def load_moge_model(
         *,
         device_name: str,
@@ -469,6 +540,120 @@ def gaussian_eval(
                 final_error=float("nan"),
             )
             print(f"[WARN] Gaussian test {t + 1}/{tests} failed with exception: {exc}")
+        finally:
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+
+def gaussian_dvs_eval(
+        scene_ply: str | Path,
+        images_dir: str | Path,
+        colmap_images_txt: str | Path,
+        tests: int,
+        runs_csv: str | Path,
+        *,
+        verbose: bool = False,
+        pose_tweak: float = 0.1,
+        K: Optional[np.ndarray] = None,
+        cost_tolerance: float = 1.5e4,
+        error_tolerance: Optional[float] = 0.3,
+        max_iters: int = 200,
+        gain_at_zero: float = 1.5,
+        gain_at_infinity: float = 0.1,
+        slope_at_zero: float = 4.0,
+        interaction_matrix_type: str = "current",
+) -> None:
+    """
+    Run Gaussian DVS multiple times with random desired images from COLMAP `images.txt`.
+
+    Each run:
+      1. Samples a random image from the COLMAP list.
+      2. Tweaks its pose by `pose_tweak` to get the initial pose.
+      3. Runs `gaussian_dvs` with raw photometric control (ViSP-style).
+      4. Appends the result to `runs_csv`.
+    """
+    from src.servoing.gaussian_dvs import gaussian_dvs
+
+    scene_ply = Path(scene_ply)
+    images_dir = Path(images_dir)
+    tests = int(tests)
+
+    entries = _load_colmap_image_entries(colmap_images_txt)
+    if not entries:
+        raise ValueError(f"No image entries parsed from {colmap_images_txt}")
+
+    if verbose:
+        print(
+            f"[gaussian_dvs_eval] Loaded {len(entries)} COLMAP entries from {colmap_images_txt}"
+        )
+        print(
+            f"[gaussian_dvs_eval] tests={tests}, pose_tweak={pose_tweak}, "
+            f"interaction_matrix_type={interaction_matrix_type}"
+        )
+
+    for t in range(tests):
+        sampled = entries[int(np.random.randint(0, len(entries)))]
+        run_desired_rgb_path = images_dir / str(sampled["image_name"])
+        run_desired_pose = np.asarray(sampled["pose_c2w"], dtype=np.float32).reshape(-1)
+        random_pose = np.full(6, np.nan, dtype=np.float32)
+
+        try:
+            if not run_desired_rgb_path.exists():
+                raise FileNotFoundError(f"Missing desired image file: {run_desired_rgb_path}")
+
+            if verbose:
+                print(
+                    f"[gaussian_dvs_eval] Test {t + 1}/{tests}: "
+                    f"image_id={sampled['image_id']}, image={sampled['image_name']}"
+                )
+
+            random_pose = tweak_pose(run_desired_pose, tweak=pose_tweak)
+            run_metrics = gaussian_dvs(
+                scene=scene_ply,
+                initial_pose=random_pose,
+                desired_view=run_desired_rgb_path,
+                desired_pose=run_desired_pose,
+                K=K,
+                max_iters=max_iters,
+                cost_tolerance=cost_tolerance,
+                error_tolerance=error_tolerance,
+                gain_at_zero=gain_at_zero,
+                gain_at_infinity=gain_at_infinity,
+                slope_at_zero=slope_at_zero,
+                interaction_matrix_type=interaction_matrix_type,
+                verbose=verbose,
+                save_frames=False,
+                save_video=False,
+            )
+            append_dvs_run_to_csv(
+                runs_csv,
+                desired_image_path=run_desired_rgb_path,
+                desired_pose=run_desired_pose,
+                initial_pose=random_pose,
+                converged=run_metrics["converged"],
+                iterations_before_converging=run_metrics["iterations"],
+                final_pose=run_metrics["final_pose"],
+                final_cost=run_metrics["final_cost"],
+                interaction_matrix_type=interaction_matrix_type,
+            )
+            print(
+                f"[INFO] DVS test {t + 1}/{tests} completed: "
+                f"{'Success' if run_metrics['converged'] else 'Failed'}"
+            )
+        except Exception as exc:
+            append_dvs_run_to_csv(
+                runs_csv,
+                desired_image_path=run_desired_rgb_path,
+                desired_pose=run_desired_pose,
+                initial_pose=random_pose,
+                converged=False,
+                iterations_before_converging=0,
+                final_pose=np.full(6, np.nan, dtype=np.float32),
+                final_cost=float("nan"),
+                interaction_matrix_type=interaction_matrix_type,
+            )
+            print(f"[WARN] DVS test {t + 1}/{tests} failed with exception: {exc}")
         finally:
             gc.collect()
             if torch.cuda.is_available():
@@ -1019,6 +1204,46 @@ if __name__ == "__main__":
     #     summarize_mesh_eval(Path("logs/fbvs_gaussian_runs_dynamic.csv"), print_summary=True)
 
     ###################################################################################################################
+    # EVAL: Gaussian DVS — photometric servoing (ViSP-style, raw pixel error)
+    ###################################################################################################################
+    # Run multiple DVS Gaussian tests using dense photometric control (no feature matching).
+    # Interaction matrix type controls the Jacobian approximation:
+    #   "current"  — re-evaluated from current render each iteration (most accurate)
+    #   "desired"  — fixed at desired pose (cheaper; requires desired_pose in COLMAP)
+    #   "mean"     — average of current and desired (balanced)
+    #
+    # Usage: python main.py --tests 50 --pose-tweak 0.10 --runs-csv logs/dvs_gaussian_runs.csv
+    #
+    K_gaussian = np.array(
+        [
+            [1040.0073037593279, 0.0, 632.0],
+            [0.0, 1040.1927566661841, 416.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+
+    gaussian_dvs_eval(
+        scene_ply=Path("data/playroom/playroom.ply"),
+        images_dir=Path("data/playroom/images"),
+        colmap_images_txt=Path("data/playroom/info/images.txt"),
+        tests=args.tests,
+        runs_csv=Path("logs/dvs_gaussian_runs.csv"),
+        verbose=args.verbose,
+        pose_tweak=args.pose_tweak,
+        K=K_gaussian,
+        max_iters=200,
+        cost_tolerance=1.5e4,
+        error_tolerance=0.3,
+        gain_at_zero=1.5,
+        gain_at_infinity=0.1,
+        slope_at_zero=4.0,
+        interaction_matrix_type="current",
+    )
+    if args.summary:
+        summarize_mesh_eval(Path("logs/dvs_gaussian_runs.csv"), print_summary=True)
+
+    ###################################################################################################################
     # SINGLE EXAMPLE: FBVS Mesh - Static Features
     ###################################################################################################################
     # Run a single FBVS mesh simulation using static feature tracking.
@@ -1226,47 +1451,98 @@ if __name__ == "__main__":
     # Run a single Direct Visual Servoing simulation on a Gaussian Splatting scene.
     # Uses dense photometric error (ZN Gauss-Newton) instead of sparse feature matching.
     #
-    from src.servoing.gaussian_dvs import gaussian_dvs
-    from src.servoing.gaussian_fbvs import get_pose_colmap
+    # from src.servoing.gaussian_dvs import gaussian_dvs
+    # from src.servoing.gaussian_fbvs import get_pose_colmap
+    #
+    # gaussian_scene_ply = Path("data/playroom/playroom.ply")
+    # gaussian_desired_view = Path("data/playroom/images/DSC05574.jpg")
+    # gaussian_colmap_images = Path("data/playroom/info/images.txt")
+    # gaussian_target_image_id = 3
+    #
+    # K_gaussian = np.array(
+    #     [
+    #         [1040.0073037593279, 0.0, 632.0],
+    #         [0.0, 1040.1927566661841, 416.0],
+    #         [0.0, 0.0, 1.0],
+    #     ],
+    #     dtype=np.float32,
+    # )
+    #
+    # desired_pose_gaussian = get_pose_colmap(
+    #     gaussian_target_image_id, path=gaussian_colmap_images
+    # )
+    # if desired_pose_gaussian is None:
+    #     raise ValueError(
+    #         f"Could not find image_id={gaussian_target_image_id} in {gaussian_colmap_images}"
+    #     )
+    #
+    # initial_pose_gaussian = tweak_pose(desired_pose_gaussian, tweak=0.10)
+    #
+    # run_metrics_dvs = gaussian_dvs(
+    #     scene=gaussian_scene_ply,
+    #     initial_pose=desired_pose_gaussian,
+    #     desired_view=gaussian_desired_view,
+    #     K=K_gaussian,
+    #     desired_pose=desired_pose_gaussian,
+    #     cost_tolerance=1e3,
+    #     gain_at_zero=1.5,
+    #     gain_at_infinity=0.1,
+    #     slope_at_zero=4.0,
+    #     max_iters=20,
+    #     verbose=False,
+    #     save_frames=True,
+    #     frames_dir="debug_frames",
+    #     save_video=True,
+    # )
+    # print(f"[single_dvs_gaussian_example] {run_metrics_dvs}")
 
-    gaussian_scene_ply = Path("data/playroom/playroom.ply")
-    gaussian_desired_view = Path("data/playroom/images/DSC05574.jpg")
-    gaussian_colmap_images = Path("data/playroom/info/images.txt")
-    gaussian_target_image_id = 3
-
-    K_gaussian = np.array(
-        [
-            [1040.0073037593279, 0.0, 632.0],
-            [0.0, 1040.1927566661841, 416.0],
-            [0.0, 0.0, 1.0],
-        ],
-        dtype=np.float32,
-    )
-
-    desired_pose_gaussian = get_pose_colmap(
-        gaussian_target_image_id, path=gaussian_colmap_images
-    )
-    if desired_pose_gaussian is None:
-        raise ValueError(
-            f"Could not find image_id={gaussian_target_image_id} in {gaussian_colmap_images}"
-        )
-
-    initial_pose_gaussian = tweak_pose(desired_pose_gaussian, tweak=0.10)
-
-    run_metrics_dvs = gaussian_dvs(
-        scene=gaussian_scene_ply,
-        initial_pose=desired_pose_gaussian,
-        desired_view=gaussian_desired_view,
-        K=K_gaussian,
-        desired_pose=desired_pose_gaussian,
-        cost_tolerance=1e3,
-        gain=4.0,
-        max_iters=20,
-        verbose=True,
-        save_frames=True,
-        frames_dir="debug_frames",
-        save_video=True,
-    )
-    print(f"[single_dvs_gaussian_example] {run_metrics_dvs}")
+    ###################################################################################################################
+    # SINGLE EXAMPLE: DVS Gaussian (Photometric Visual Servoing)
+    ###################################################################################################################
+    # Run a single Photometric Visual Servoing (PVS) simulation on a Gaussian Splatting scene.
+    # Implements Rodriguez et al. (2020): v = -λ L̂⁺_Ī(ξ*) · (Ī(ξ) - Ī(ξ*))
+    #
+    # from src.servoing.gaussian_dvs import gaussian_dvs
+    # from src.servoing.gaussian_fbvs import get_pose_colmap
+    #
+    # gaussian_scene_ply = Path("data/playroom/playroom.ply")
+    # gaussian_desired_view = Path("data/playroom/images/DSC05579.jpg")
+    # gaussian_colmap_images = Path("data/playroom/info/images.txt")
+    #
+    # K_gaussian = np.array(
+    #     [
+    #         [1040.0073037593279, 0.0, 632.0],
+    #         [0.0, 1040.1927566661841, 416.0],
+    #         [0.0, 0.0, 1.0],
+    #     ],
+    #     dtype=np.float32,
+    # )
+    #
+    # desired_pose_gaussian = get_pose_colmap(
+    #     gaussian_desired_view, path=gaussian_colmap_images
+    # )
+    # initial_pose_gaussian = tweak_pose(desired_pose_gaussian, tweak=0.15)
+    #
+    # run_metrics_pvs = gaussian_dvs(
+    #     scene=gaussian_scene_ply,
+    #     initial_pose=initial_pose_gaussian,
+    #     desired_view=gaussian_desired_view,
+    #     K=K_gaussian,
+    #     desired_pose=desired_pose_gaussian,
+    #     max_iters=200,
+    #     cost_tolerance=1.5e4,
+    #     error_tolerance=0.3,
+    #     gain_at_zero=1.5,          # λ₀ — gain near convergence (high for fast settling)
+    #     gain_at_infinity=0.1,      # λ∞ — gain far from target (low for stability)
+    #     slope_at_zero=4.0,         # slope of gain curve at zero error
+    #     dt=1.0,
+    #     interaction_matrix_type="current",  # "current", "desired", or "mean"
+    #     verbose=True,
+    #     save_frames=True,
+    #     frames_dir="debug_frames_pvs",
+    #     save_video=True,
+    #     video_path="output_gs_pvs.mp4",
+    # )
+    # print(f"[single_pvs_gaussian_example] {run_metrics_pvs}")
 
     ###################################################################################################################

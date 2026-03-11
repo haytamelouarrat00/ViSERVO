@@ -493,16 +493,14 @@ class PhotometricVisualServoingZN:
         L_I = self.compute_interaction_matrix(Ix, Iy, Z, self.camera)
 
         # 3. Gauss-Newton control law (Eq. 3)
-        # v = -λ * L_I⁺ * e
-        try:
-            # Moore-Penrose pseudo-inverse
-            L_I_pinv = np.linalg.pinv(L_I)
-            v = -self.lambda_gain * L_I_pinv @ error
-        except np.linalg.LinAlgError:
-            # Fallback: damped least squares
-            H = L_I.T @ L_I
-            H_damped = H + 1e-6 * np.eye(6)
-            v = -self.lambda_gain * np.linalg.solve(H_damped, L_I.T @ error)
+        # v = -λ * (L_I^T L_I)^{-1} L_I^T * e
+        # Use normal equations instead of pinv: numerically stable on large (N,6) matrices.
+        L_I_64 = L_I.astype(np.float64)
+        H = L_I_64.T @ L_I_64                          # (6,6)
+        g = L_I_64.T @ error.astype(np.float64)        # (6,)
+        damping = 1e-6 * float(np.trace(H) / 6.0 + 1e-12)
+        H_damped = H + damping * np.eye(6)
+        v = -self.lambda_gain * np.linalg.solve(H_damped, g)
 
         # 4. Check convergence
         velocity_norm = float(np.linalg.norm(v))

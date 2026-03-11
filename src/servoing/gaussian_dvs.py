@@ -13,7 +13,8 @@ from src.control import (
     interaction_matrix,
     normalize_features,
     velocity, photometric_error,
-    normalize_image
+    normalize_image, ZNSSD,
+    image_gradient, PhotometricVisualServoingZN,
 )
 from src.features import XFeatMatcher
 from src.render_pipeline import render_gaussian_view
@@ -212,7 +213,8 @@ def gaussian_dvs(
     video_writer = None
     enable_video = bool(verbose and save_video)
     if enable_video:
-        video_writer, _ = _make_video_writer(video_path, cam_w, cam_h, fps=fps)
+        video_writer, _ = _make_video_writer(video_path, cam_w * 3 // 2, cam_h, fps=fps)
+        # panel is 3× wide (current | desired | error), writer uses 3*cam_w
 
     frame_output_dir = None
     saved_frame_count = 0
@@ -256,8 +258,153 @@ def gaussian_dvs(
         cv2.imwrite("debug_ph_diff.png", panel)
 
     error, cost = photometric_error(render_gray, real_gray)
+    znssd = ZNSSD(real_gray, render_gray)
+
     if verbose:
-        print('[Gaussian DVS] Cost: ', cost)
+        print('[Gaussian DVS] Initial cost: ', cost, '  ZNSSD: ', znssd)
 
+    # --- PVS controller ---
+    pvs = PhotometricVisualServoingZN(
+        camera=camera,
+        lambda_gain=gain,
+        use_zero_mean_normalization=use_zero_mean_normalization,
+        use_gradient_magnitude=use_gradient_magnitude,
+        verbose=verbose,
+    )
 
-    
+    fx = float(camera.intrinsics.fx)
+    fy = float(camera.intrinsics.fy)
+
+    # Desired-image gradients (evaluated once at ξ*, used to approximate L̂_Ī(ξ*))
+    Ix_des, Iy_des = image_gradient(real_gray, fx=fx, fy=fy)
+
+    try:
+        while not converged and iteration < max_iters:
+            # 1. Render current view
+            camera.set_pose(position=camera_pose[:3], orientation=camera_pose[3:])
+            result = render_gaussian_view(
+                scene=scene_obj,
+                camera_pose=camera_pose,
+                scene_pose=scene_pose_np,
+                device=str(device),
+                camera=camera,
+                return_depth=True,
+            )
+            render_rgb = np.asarray(result.rgb, dtype=np.float32)
+            render_gray = cv2.cvtColor(render_rgb, cv2.COLOR_RGB2GRAY)
+            render_gray = normalize_image(render_gray)
+            render_depth = np.asarray(result.depth, dtype=np.float32)
+
+            # 2. Compute current-image gradients
+            Ix, Iy = image_gradient(render_gray, fx=fx, fy=fy)
+
+            # 3. Control law: v = -λ L̂⁺_Ī(ξ*) · (Ī(ξ) - Ī(ξ*))
+            v_cmd, cost = pvs.compute_control_velocity(
+                I_current=render_gray,
+                I_desired=real_gray,
+                Ix=Ix,
+                Iy=Iy,
+                Z=render_depth,
+                Ix_des=Ix_des,
+                Iy_des=Iy_des,
+            )
+
+            # Clamp velocity to keep camera inside the scene.
+            # Without clamping, large initial errors send the camera outside the scene
+            # (all-black renders → zero gradients → control law collapses).
+            _t_norm = float(np.linalg.norm(v_cmd[:3]))
+            _r_norm = float(np.linalg.norm(v_cmd[3:]))
+            _MAX_T = 0.3   # max 30 cm translation per iteration
+            _MAX_R = 0.3   # max ~17° rotation per iteration
+            if _t_norm > _MAX_T:
+                v_cmd[:3] *= _MAX_T / _t_norm
+            if _r_norm > _MAX_R:
+                v_cmd[3:] *= _MAX_R / _r_norm
+
+            znssd = ZNSSD(real_gray, render_gray)
+
+            # 4. Visualization
+            need_panel = verbose or enable_video or enable_frames
+            if need_panel:
+                render_rgb_u8 = np.clip(render_rgb * 255.0, 0, 255).astype(np.uint8)
+                render_bgr_vis = cv2.cvtColor(render_rgb_u8, cv2.COLOR_RGB2BGR)
+                panel = _compose_current_target_view(render_bgr_vis, real_bgr)
+
+                # Photometric error map: visually confirms camera movement even for small steps
+                ph_diff = render_gray - real_gray
+                err_vis = np.clip(
+                    (ph_diff - ph_diff.min()) / (ph_diff.max() - ph_diff.min() + 1e-8) * 255.0,
+                    0, 255,
+                ).astype(np.uint8)
+                err_color = cv2.applyColorMap(err_vis, cv2.COLORMAP_JET)
+                err_color = cv2.resize(err_color, (render_bgr_vis.shape[1], render_bgr_vis.shape[0]))
+                panel = np.hstack([panel, err_color])
+
+                # Iteration / pose / cost text overlay
+                v_norm = float(np.linalg.norm(v_cmd))
+                cv2.putText(panel, f"iter={iteration}  cost={cost:.2e}  ZNSSD={znssd:.4f}  ||v||={v_norm:.4f}",
+                            (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+                cv2.putText(panel, f"pose={[round(float(x), 3) for x in camera_pose]}",
+                            (10, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1, cv2.LINE_AA)
+
+                if enable_video and video_writer is not None:
+                    video_writer.write(panel)
+                if enable_frames and frame_output_dir is not None:
+                    frame_path = frame_output_dir / f"frame_{iteration:04d}.png"
+                    if cv2.imwrite(str(frame_path), panel):
+                        saved_frame_count += 1
+                if verbose:
+                    _safe_imshow(vis_window_name, panel, vis_wait_ms)
+
+            if verbose:
+                print(
+                    f"[Gaussian DVS] Iter {iteration}: "
+                    f"cost={cost:.4f}  ZNSSD={znssd:.4f}  ||v||={np.linalg.norm(v_cmd):.6f}  "
+                    f"pose={[round(float(x), 3) for x in camera_pose]}"
+                )
+
+            # 5. Check convergence
+            if cost < cost_tolerance:
+                converged = True
+                break
+            if error_tolerance is not None and znssd < error_tolerance:
+                converged = True
+                break
+
+            # 6. Apply velocity and update pose
+            camera.apply_velocity(v_cmd, dt=dt, frame="camera")
+            position, orientation = camera.get_pose()
+            camera_pose = np.concatenate([position, orientation]).astype(np.float32)
+
+            iteration += 1
+
+    finally:
+        if enable_video and video_writer is not None:
+            video_writer.release()
+            if verbose:
+                print(f"[Gaussian DVS] Video saved to {video_path}")
+        if enable_frames and frame_output_dir is not None and verbose:
+            print(f"[Gaussian DVS] Saved {saved_frame_count} debug frames to {frame_output_dir}")
+        if verbose:
+            try:
+                cv2.destroyWindow(vis_window_name)
+                cv2.waitKey(1)
+            except cv2.error:
+                pass
+        scene_obj.cleanup()
+
+    print(f"[Gaussian DVS] converged={converged}")
+    print(f"[Gaussian DVS] final_pose={[round(x, 3) for x in camera_pose.flatten()]}")
+    if desired_pose is not None:
+        desired_pose_arr = np.asarray(desired_pose, dtype=np.float32).reshape(-1)
+        if desired_pose_arr.size >= 6:
+            diff = desired_pose_arr[:6] - camera_pose[:6]
+            print(f"Final Difference: position => {diff[:3]}, rotation => {diff[3:]}")
+
+    final_cost = float(pvs.cost_history[-1]) if pvs.cost_history else float("nan")
+    return {
+        "converged": bool(converged),
+        "iterations": int(iteration),
+        "final_pose": camera_pose.copy(),
+        "final_cost": final_cost,
+    }

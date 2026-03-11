@@ -127,7 +127,7 @@ def _init_features_and_world_points(
 
 
 def get_pose_colmap(
-    image_id: int, path: str | Path = "data/playroom/info/images.txt"
+    image_id: int | str | Path, path: str | Path = "data/playroom/info/images.txt"
 ) -> Optional[np.ndarray]:
     """
     Read a COLMAP image pose and return camera pose in world frame.
@@ -138,13 +138,21 @@ def get_pose_colmap(
         [x, y, z, rx, ry, rz] where xyz is camera center in world and
         r* are XYZ Euler angles of R_c2w.
     """
+    # Accept either a numeric ID or an image filename / path
+    match_by_name = not str(image_id).lstrip("-").isdigit()
+    target_name = Path(image_id).name if match_by_name else None
+
     with open(path, encoding="utf-8") as f:
         lines = [l.strip() for l in f if l.strip() and not l.startswith("#")]
 
     for i in range(0, len(lines), 2):
         parts = lines[i].split()
-        if int(parts[0]) != int(image_id):
-            continue
+        if match_by_name:
+            if parts[-1] != target_name:
+                continue
+        else:
+            if int(parts[0]) != int(image_id):
+                continue
 
         qw, qx, qy, qz = map(float, parts[1:5])
         tx, ty, tz = map(float, parts[5:8])

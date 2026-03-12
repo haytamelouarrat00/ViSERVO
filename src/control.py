@@ -147,9 +147,12 @@ def velocity(L: np.ndarray, error: np.ndarray, gain: float = 1.0) -> np.ndarray:
     if L.shape[1] != 6:
         raise ValueError(f"Expected L to have 6 columns, got {L.shape[1]}")
 
-    # Compute the pseudo-inverse of L
-    L_pinv = np.linalg.pinv(L)
-    v = -float(gain) * (L_pinv @ error)
+    # Normal equations: (LᵀL)⁻¹ Lᵀ e  — stable on large (2N,6) matrices, avoids
+    # computing the full (6,2N) pseudo-inverse.
+    H = L.T @ L                                          # (6,6)
+    g = L.T @ error                                      # (6,)
+    damp = 1e-6 * (float(np.trace(H)) / 6.0 + 1e-12)
+    v = -float(gain) * np.linalg.solve(H + damp * np.eye(6), g)
     return np.asarray(v, dtype=np.float32).reshape(6)
 
 

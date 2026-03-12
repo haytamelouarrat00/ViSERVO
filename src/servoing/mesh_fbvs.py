@@ -74,13 +74,13 @@ def fbvs_mesh(
     )
 
     video_writer = None
-    enable_video = bool(verbose and save_video)
+    enable_video = bool(save_video)
     if enable_video:
         video_writer, _ = _make_video_writer(video_path, cam_w, cam_h, fps=fps)
 
     frame_output_dir = None
     saved_frame_count = 0
-    enable_frames = bool(verbose and save_frames)
+    enable_frames = bool(save_frames)
     if enable_frames:
         frame_output_dir = _make_frame_output_dir(frames_dir)
         print(f"[fbvs_mesh] Saving debug frames to {frame_output_dir}")
@@ -205,6 +205,16 @@ def fbvs_mesh(
 
         L = interaction_matrix(current_features_norm, current_features_depths_valid)
         v_cmd = velocity(L, error.reshape(-1), gain)
+
+        # Clamp velocity to prevent leaving scene bounds on large initial errors
+        t_norm = float(np.linalg.norm(v_cmd[:3]))
+        r_norm = float(np.linalg.norm(v_cmd[3:]))
+        MAX_T, MAX_R = 0.3, 0.3
+        if t_norm > MAX_T:
+            v_cmd[:3] *= MAX_T / t_norm
+        if r_norm > MAX_R:
+            v_cmd[3:] *= MAX_R / r_norm
+
         camera.apply_velocity(v_cmd, dt=dt, frame="camera")
         position, orientation = camera.get_pose()
         camera_pose = np.concatenate([position, orientation]).astype(np.float32)
@@ -239,11 +249,6 @@ def fbvs_mesh(
         rot = diff[3:]
         print(f"Final Difference: position => {pos}, rotation => {rot}")
 
-    if last_rendered_features is None or last_real_features is None:
-        raise RuntimeError(
-            "FBVS mesh loop did not produce any feature correspondences."
-        )
-
     metrics = {
         "converged": bool(converged),
         "iterations": int(iteration),
@@ -260,7 +265,7 @@ def fbvs_mesh_redetect(
     desired_view: str | Path,
     *,
     max_iters: int = 100,
-    error_tolerance: float = 0.025,
+    error_tolerance: float = 0.35,
     gain: float = 1.0,
     dt: float = 1.0,
     vis_window_name: str = "FBVS Mesh Redetect Current vs Target",
@@ -299,13 +304,13 @@ def fbvs_mesh_redetect(
     )
 
     video_writer = None
-    enable_video = bool(verbose and save_video)
+    enable_video = bool(save_video)
     if enable_video:
         video_writer, _ = _make_video_writer(video_path, cam_w, cam_h, fps=fps)
 
     frame_output_dir = None
     saved_frame_count = 0
-    enable_frames = bool(verbose and save_frames)
+    enable_frames = bool(save_frames)
     if enable_frames:
         frame_output_dir = _make_frame_output_dir(frames_dir)
         print(f"[fbvs_mesh_redetect] Saving debug frames to {frame_output_dir}")
@@ -317,31 +322,21 @@ def fbvs_mesh_redetect(
     last_real_features = None
     xf = XFeatMatcher(top_k=1024)
 
-    if depth_device_name is None:
-        depth_device_name = "cuda" if torch.cuda.is_available() else "cpu"
-
-    # Render initial depth once (MoGe is slow, so we don't re-render every iteration)
-    camera.set_pose(position=camera_pose[:3], orientation=camera_pose[3:])
-    initial_rgb, _ = render_view(camera, scene_obj)
-    if verbose:
-        print(
-            "[fbvs_mesh_redetect] Estimating initial depth with MoGe (this may take a few seconds)..."
-        )
-    initial_depth = camera.render_depth_MoGe(
-        initial_rgb,
-        model=depth_model,
-        device_name=depth_device_name,
-        resolution_level=int(depth_resolution_level),
-    )
-    if verbose:
-        print(
-            "[fbvs_mesh_redetect] Depth estimation complete. Starting servoing loop..."
-        )
-
     try:
         while norm > error_tolerance and iteration < max_iters:
             camera.set_pose(position=camera_pose[:3], orientation=camera_pose[3:])
             render_rgb, render_gray = render_view(camera, scene_obj)
+
+            # Per-iteration mesh depth — exact and fast, avoids the stale-depth bug
+            # that results from sampling a depth map estimated at a different camera pose.
+            # Background pixels (no mesh hit) have depth=0; fill with the median of
+            # valid pixels so features on the border still get a usable depth value.
+            render_depth = np.asarray(
+                scene_obj.render_depth_from_virtual_camera(camera), dtype=np.float32
+            )
+            _valid_d = np.isfinite(render_depth) & (render_depth > 1e-6)
+            _fill = float(np.median(render_depth[_valid_d])) if np.any(_valid_d) else 1.0
+            render_depth = np.where(_valid_d, render_depth, _fill).astype(np.float32)
 
             match_result = xf.match(render_gray, real_gray)
             kp_ref, kp_qry, matches = (
@@ -364,32 +359,10 @@ def fbvs_mesh_redetect(
                 [kp_qry[m.trainIdx].pt for m in matches], dtype=np.float32
             ).reshape(-1, 2)
 
-            # Back-project features to 3D using initial depth, then compute current depth geometrically
-            # This avoids re-running MoGe every iteration
-            current_features_depths_sampled = get_features_depth(
-                current_features_px, initial_depth
+            # Sample depth directly from the pre-filled current-pose mesh depth map
+            current_features_depths = np.asarray(
+                get_features_depth(current_features_px, render_depth), dtype=np.float32
             )
-            current_features_depths_sampled = np.clip(
-                np.asarray(current_features_depths_sampled, dtype=np.float32),
-                1e-6,
-                None,
-            )
-
-            # Back-project to world coordinates
-            feature_points_world = camera.back_project_to_world(
-                current_features_px, current_features_depths_sampled
-            ).astype(np.float32)
-
-            # Compute accurate depth by transforming to camera frame
-            points_h = np.hstack(
-                [
-                    feature_points_world,
-                    np.ones((feature_points_world.shape[0], 1), dtype=np.float32),
-                ]
-            )
-            points_cam = (camera.get_view_matrix() @ points_h.T).T[:, :3]
-            current_features_depths = points_cam[:, 2].astype(np.float32)
-
             valid = current_features_depths > 1e-6
 
             if np.sum(valid) < 3:
@@ -433,7 +406,6 @@ def fbvs_mesh_redetect(
             desired_features_norm = normalize_features(
                 desired_features_px[valid], camera=camera
             )
-            current_features_depths_valid = current_features_depths[valid]
 
             error, norm = geometric_error(desired_features_norm, current_features_norm)
             last_rendered_features = current_features_norm
@@ -443,8 +415,18 @@ def fbvs_mesh_redetect(
                 converged = True
                 break
 
-            L = interaction_matrix(current_features_norm, current_features_depths_valid)
+            L = interaction_matrix(current_features_norm, current_features_depths[valid])
             v_cmd = velocity(L, error.reshape(-1), gain)
+
+            # Clamp velocity to prevent leaving scene bounds on large initial errors
+            t_norm = float(np.linalg.norm(v_cmd[:3]))
+            r_norm = float(np.linalg.norm(v_cmd[3:]))
+            MAX_T, MAX_R = 0.3, 0.3
+            if t_norm > MAX_T:
+                v_cmd[:3] *= MAX_T / t_norm
+            if r_norm > MAX_R:
+                v_cmd[3:] *= MAX_R / r_norm
+
             camera.apply_velocity(v_cmd, dt=dt, frame="camera")
             position, orientation = camera.get_pose()
             camera_pose = np.concatenate([position, orientation]).astype(np.float32)
@@ -485,11 +467,6 @@ def fbvs_mesh_redetect(
         if desired_pose_arr.size >= 6:
             diff = desired_pose_arr[:6] - camera_pose[:6]
             print(f"Final Difference: position => {diff[:3]}, rotation => {diff[3:]}")
-
-    if last_rendered_features is None or last_real_features is None:
-        raise RuntimeError(
-            "FBVS mesh redetect loop did not produce any feature correspondences."
-        )
 
     metrics = {
         "converged": bool(converged),

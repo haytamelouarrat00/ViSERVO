@@ -368,6 +368,16 @@ def fbvs(
 
             L = interaction_matrix(current_features_norm, current_features_depths_valid)
             v_cmd = velocity(L, error.reshape(-1), gain)
+
+            # Clamp velocity to prevent leaving scene bounds on large initial errors
+            t_norm = float(np.linalg.norm(v_cmd[:3]))
+            r_norm = float(np.linalg.norm(v_cmd[3:]))
+            MAX_T, MAX_R = 0.3, 0.3
+            if t_norm > MAX_T:
+                v_cmd[:3] *= MAX_T / t_norm
+            if r_norm > MAX_R:
+                v_cmd[3:] *= MAX_R / r_norm
+
             camera.apply_velocity(v_cmd, dt=dt, frame="camera")
             position, orientation = camera.get_pose()
             camera_pose = np.concatenate([position, orientation]).astype(np.float32)
@@ -568,6 +578,16 @@ def fbvs_redetect(
 
             L = interaction_matrix(current_features_norm, current_features_depths_valid)
             v_cmd = velocity(L, error.reshape(-1), gain)
+
+            # Clamp velocity to prevent leaving scene bounds on large initial errors
+            t_norm = float(np.linalg.norm(v_cmd[:3]))
+            r_norm = float(np.linalg.norm(v_cmd[3:]))
+            MAX_T, MAX_R = 0.3, 0.3
+            if t_norm > MAX_T:
+                v_cmd[:3] *= MAX_T / t_norm
+            if r_norm > MAX_R:
+                v_cmd[3:] *= MAX_R / r_norm
+
             camera.apply_velocity(v_cmd, dt=dt, frame="camera")
             position, orientation = camera.get_pose()
             camera_pose = np.concatenate([position, orientation]).astype(np.float32)

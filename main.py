@@ -1114,17 +1114,17 @@ if __name__ == "__main__":
     # Run multiple FBVS mesh tests using static feature tracking.
     # Usage: python main.py --tests 100 --pose-tweak 0.3 --runs-csv logs/fbvs_mesh_runs_static.csv
     #
-    # mesh_eval(
-    #     scene_ply=args.scene_ply,
-    #     dataset_dir=args.dataset_dir,
-    #     tests=args.tests,
-    #     runs_csv=args.runs_csv,
-    #     verbose=args.verbose,
-    #     pose_tweak=args.pose_tweak,
-    #     use_redetect=True,
-    # )
-    # if args.summary:
-    #     summarize_mesh_eval(args.runs_csv, print_summary=True)
+    mesh_eval(
+        scene_ply=args.scene_ply,
+        dataset_dir=args.dataset_dir,
+        tests=args.tests,
+        runs_csv=args.runs_csv,
+        verbose=args.verbose,
+        pose_tweak=args.pose_tweak,
+        use_redetect=True,
+    )
+    if args.summary:
+        summarize_mesh_eval(args.runs_csv, print_summary=True)
 
     ###################################################################################################################
     # BATCH EVALUATION: FBVS Mesh - Dynamic Features (Multiple Random Tests)
@@ -1214,34 +1214,34 @@ if __name__ == "__main__":
     #
     # Usage: python main.py --tests 50 --pose-tweak 0.10 --runs-csv logs/dvs_gaussian_runs.csv
     #
-    K_gaussian = np.array(
-        [
-            [1040.0073037593279, 0.0, 632.0],
-            [0.0, 1040.1927566661841, 416.0],
-            [0.0, 0.0, 1.0],
-        ],
-        dtype=np.float32,
-    )
-
-    gaussian_dvs_eval(
-        scene_ply=Path("data/playroom/playroom.ply"),
-        images_dir=Path("data/playroom/images"),
-        colmap_images_txt=Path("data/playroom/info/images.txt"),
-        tests=args.tests,
-        runs_csv=Path("logs/dvs_gaussian_runs.csv"),
-        verbose=args.verbose,
-        pose_tweak=args.pose_tweak,
-        K=K_gaussian,
-        max_iters=200,
-        cost_tolerance=1.5e4,
-        error_tolerance=0.3,
-        gain_at_zero=1.5,
-        gain_at_infinity=0.1,
-        slope_at_zero=4.0,
-        interaction_matrix_type="current",
-    )
-    if args.summary:
-        summarize_mesh_eval(Path("logs/dvs_gaussian_runs.csv"), print_summary=True)
+    # K_gaussian = np.array(
+    #     [
+    #         [1040.0073037593279, 0.0, 632.0],
+    #         [0.0, 1040.1927566661841, 416.0],
+    #         [0.0, 0.0, 1.0],
+    #     ],
+    #     dtype=np.float32,
+    # )
+    #
+    # gaussian_dvs_eval(
+    #     scene_ply=Path("data/playroom/playroom.ply"),
+    #     images_dir=Path("data/playroom/images"),
+    #     colmap_images_txt=Path("data/playroom/info/images.txt"),
+    #     tests=args.tests,
+    #     runs_csv=Path("logs/dvs_gaussian_runs.csv"),
+    #     verbose=args.verbose,
+    #     pose_tweak=args.pose_tweak,
+    #     K=K_gaussian,
+    #     max_iters=200,
+    #     cost_tolerance=1.5e4,
+    #     error_tolerance=0.3,
+    #     gain_at_zero=1.5,
+    #     gain_at_infinity=0.1,
+    #     slope_at_zero=4.0,
+    #     interaction_matrix_type="current",
+    # )
+    # if args.summary:
+    #     summarize_mesh_eval(Path("logs/dvs_gaussian_runs.csv"), print_summary=True)
 
     ###################################################################################################################
     # SINGLE EXAMPLE: FBVS Mesh - Static Features
@@ -1546,3 +1546,9 @@ if __name__ == "__main__":
     # print(f"[single_pvs_gaussian_example] {run_metrics_pvs}")
 
     ###################################################################################################################
+    """
+    if we were to restructure our entire codebase in order to have a valid   
+structure in which we have exactly one function per functionality instead  
+of ahving each framework have similar functions in other files, i want to  
+centralize logic and decentralize execution, what can we do?
+"""

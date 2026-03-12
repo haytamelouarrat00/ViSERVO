@@ -87,13 +87,13 @@ def dvs_mesh(
     )
 
     video_writer = None
-    enable_video = bool(verbose and save_video)
+    enable_video = bool(save_video)
     if enable_video:
         video_writer, _ = _make_video_writer(video_path, cam_w, cam_h, fps=fps)
 
     frame_output_dir = None
     saved_frame_count = 0
-    enable_frames = bool(verbose and save_frames)
+    enable_frames = bool(save_frames)
     if enable_frames:
         frame_output_dir = _make_frame_output_dir(frames_dir)
         print(f"[dvs_mesh] Saving debug frames to {frame_output_dir}")
@@ -158,7 +158,18 @@ def dvs_mesh(
                 Ix_des=Ix_des,
                 Iy_des=Iy_des,
             )
-            last_velocity = np.asarray(v_cmd, dtype=np.float32).reshape(6)
+            v_cmd = np.asarray(v_cmd, dtype=np.float32).reshape(6)
+
+            # Clamp velocity to prevent leaving scene bounds on large initial errors
+            t_norm = float(np.linalg.norm(v_cmd[:3]))
+            r_norm = float(np.linalg.norm(v_cmd[3:]))
+            MAX_T, MAX_R = 0.3, 0.3
+            if t_norm > MAX_T:
+                v_cmd[:3] *= MAX_T / t_norm
+            if r_norm > MAX_R:
+                v_cmd[3:] *= MAX_R / r_norm
+
+            last_velocity = v_cmd
 
             phase = "gauss-newton"
             if verbose:
@@ -257,7 +268,6 @@ def dvs_mesh(
         "final_cost": float(cost),
         "final_error": float(cost),
         "final_velocity": last_velocity.copy(),
-        "open_loop": bool(controller.in_open_loop),
         "cost_history": np.asarray(controller.cost_history, dtype=np.float64).copy(),
     }
     return metrics

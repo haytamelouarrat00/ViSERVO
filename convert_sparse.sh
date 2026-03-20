@@ -1,0 +1,1 @@
+colmap model_converter --input_path <sparse_dir> --output_path <output_dir> --output_type TXT

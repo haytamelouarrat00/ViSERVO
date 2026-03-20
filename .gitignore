@@ -1,0 +1,11 @@
+# Ignore everything
+*
+
+# Allow Python and shell scripts
+!*.py
+!*.sh
+!*.ipynb
+
+# Allow directories and this file
+!*/
+!.gitignore
